@@ -48,7 +48,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   const hi = now - LAG_MS;
   const rows = (await db.prepare(
     `SELECT event_id, name, device_id, session_id, client_ts, received_at, app_version, platform, country, level,
-       attempt, duration_ms, value, CASE WHEN name = 'level_complete' THEN props END AS props
+       attempt, duration_ms, value, CASE WHEN level IS NOT NULL AND name <> 'level_start' THEN props END AS props
      FROM events WHERE project_id = ?1 AND (received_at, event_id) > (?2, ?3) AND received_at <= ?4
      ORDER BY received_at, event_id LIMIT ?5`,
   ).bind(p.id, p.wm_at, p.wm_id, hi, chunk).all<Raw>()).results;
@@ -98,6 +98,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   const levels = new Map<string, Record<string, number>>();
   const events = new Map<string, Record<string, number>>();
   const cohorts = new Map<string, Record<string, number>>();
+  const levelEvents = new Map<string, Record<string, number>>();
   const add = (m: Map<string, Record<string, number>>, key: unknown[], field: string, n: number) => {
     const k = JSON.stringify(key);
     const o = m.get(k) ?? {};
@@ -125,12 +126,20 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     if (r.value !== null) add(events, ek, "value_sum", r.value);
     if (!dd.seen.n.includes(r.name)) { dd.seen.n.push(r.name); add(events, ek, "devices", 1); }
 
-    if (r.level === null || !LEVEL_EVENTS.has(r.name)) continue;
+    if (r.level === null) continue;
+    const props = r.props ? JSON.parse(r.props) as Record<string, unknown> : {};
+    if (r.name !== "level_start" && r.name !== "level_complete") {
+      const d = props.reason ?? props.via ?? props.booster;
+      const detail = typeof d === "string" || typeof d === "number" || typeof d === "boolean" ? String(d).slice(0, 40) : "";
+      add(levelEvents, [day, r.level, r.name, String(detail), v, pl], "count", 1);
+    }
+    if (!LEVEL_EVENTS.has(r.name)) continue;
     const lk = [day, r.level, v, pl];
     // By attempt, not session, so a level resumed after a restart still closes; session only when attempt is missing.
     const ok = JSON.stringify([r.level, r.attempt ?? "s:" + r.session_id]);
     if (r.name === "level_start") {
       add(levels, lk, "starts", 1);
+      if (r.attempt === 1) add(levels, lk, "first_starts", 1);
       if (!dd.seen.l.includes(r.level)) { dd.seen.l.push(r.level); add(levels, lk, "players", 1); }
       dev.open[ok] = { r: r.received_at, d: day, v, p: pl, l: r.level };
       dev.dirty = true;
@@ -140,11 +149,8 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     add(levels, lk, field, 1);
     if (field === "wins" && r.attempt === 1) add(levels, lk, "first_try_wins", 1);
     if (r.duration_ms !== null) { add(levels, lk, "duration_sum", r.duration_ms); add(levels, lk, "duration_n", 1); }
-    if (r.props) {
-      const props = JSON.parse(r.props) as Record<string, unknown>;
-      if (typeof props.stars === "number") { add(levels, lk, "stars_sum", props.stars); add(levels, lk, "stars_n", 1); }
-      if (typeof props.moves_left === "number") { add(levels, lk, "moves_left_sum", props.moves_left); add(levels, lk, "moves_left_n", 1); }
-    }
+    if (field === "wins" && typeof props.stars === "number") { add(levels, lk, "stars_sum", props.stars); add(levels, lk, "stars_n", 1); }
+    if (field === "wins" && typeof props.moves_left === "number") { add(levels, lk, "moves_left_sum", props.moves_left); add(levels, lk, "moves_left_n", 1); }
     const o = dev.open[ok];
     if (o) {
       // The start was already counted as a quit; the late result takes it back.
@@ -173,7 +179,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   });
   const flat = (m: Map<string, Record<string, number>>, fields: string[]) =>
     [...m].map(([k, o]) => [...JSON.parse(k), ...fields.map((f) => o[f] ?? 0)]);
-  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n"];
+  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts"];
   const EVENT_FIELDS = ["count", "devices", "value_sum"];
 
   const col = (n: number) => Array.from({ length: n }, (_, i) => `json_extract(value, '$[${i}]')`).join(", ");
@@ -202,6 +208,10 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       SELECT ?1, ${col(4 + EVENT_FIELDS.length)} FROM json_each(?2) WHERE true
       ON CONFLICT (project_id, day, name, version, platform) DO UPDATE SET ${sum("event_days", EVENT_FIELDS)}`,
       flat(events, EVENT_FIELDS)),
+    ...upsert(`INSERT INTO level_events (project_id, day, level, name, detail, version, platform, count)
+      SELECT ?1, ${col(7)} FROM json_each(?2) WHERE true
+      ON CONFLICT (project_id, day, level, name, detail, version, platform) DO UPDATE SET ${sum("level_events", ["count"])}`,
+      flat(levelEvents, ["count"])),
     db.prepare(`UPDATE projects SET wm_at = ?2, wm_id = ?3,
         rebuild_from = CASE WHEN ?4 THEN NULL ELSE rebuild_from END, rebuild_until = CASE WHEN ?4 THEN NULL ELSE rebuild_until END
       WHERE id = ?1`).bind(p.id, last?.received_at ?? p.wm_at, last?.event_id ?? p.wm_id, endRebuild ? 1 : 0),
@@ -230,7 +240,7 @@ async function startRebuild(db: D1Database, p: Project, now: number): Promise<Pr
     wm_id: p.wm_at <= from - DAY ? p.wm_id : "",
   };
   await db.batch([
-    ...["device_days", "level_days", "event_days", "cohort_days"].map((t) =>
+    ...["device_days", "level_days", "event_days", "cohort_days", "level_events"].map((t) =>
       db.prepare(`DELETE FROM ${t} WHERE project_id = ? AND day >= ?`).bind(p.id, day)),
     db.prepare("DELETE FROM devices WHERE project_id = ? AND first_day >= ?").bind(p.id, day),
     db.prepare("UPDATE devices SET open = NULL, open_min = NULL WHERE project_id = ? AND open IS NOT NULL").bind(p.id),

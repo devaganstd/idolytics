@@ -53,6 +53,12 @@ describe("projects", () => {
 });
 
 const RANGE = "range=custom&from=2026-11-01&to=2026-11-03";
+/** Text of each cell in the table row whose first cell reads first. */
+const cells = (html: string, first: string) => {
+  const row = [...html.matchAll(/<tr>(.*?)<\/tr>/gs)].map((m) => [...m[1].matchAll(/<t[dh][^>]*>(.*?)<\/t[dh]>/gs)].map((c) => c[1].replace(/<[^>]+>/g, "").trim()))
+    .find((r) => r[0] === first);
+  return row;
+};
 const kpi = (html: string, key: string) => html.match(new RegExp(`data-kpi="${key}"[^>]*><h3>[^<]*</h3><p class="value">([^<]*)<`))?.[1];
 
 describe("dashboard pages", () => {
@@ -111,18 +117,109 @@ describe("dashboard pages", () => {
     expect((row.match(/class="incomplete"/g) ?? []).length).toBe(11); // D20 to D30, as today is 11-21
   });
 
-  it("shows the level table", async () => {
+  it("shows the level table with distinct players and first try win rate", async () => {
     const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
-    expect(html).toContain("<td>1</td><td>3</td><td>2</td><td>1</td><td>0</td>");
-    expect(html).toContain("<td>67%</td><td>1.5</td>");
-    expect(html).toContain("1m 33s"); // (120 + 100 + 60) s / 3
+    // Level 1: d1 fails then wins on attempt 2, d2 wins on attempt 1. Level 2: d2 left it, d1 quit it the next day.
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(html).toContain('href="/level?project=demo&amp;range=custom&amp;from=2026-11-01&amp;to=2026-11-03&amp;level=1"');
+    expect(html).toMatch(/Quits \(inferred\)/);
   });
 
+  it("sorts the level table by a column", async () => {
+    const html = await (await get(`/levels?project=demo&${RANGE}&sort=quits&dir=desc`)).text();
+    expect(html.indexOf('level=2"')).toBeLessThan(html.indexOf('level=1"'));
+  });
+
+  it("shows the progression funnel", async () => {
+    const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    const funnel = html.slice(html.indexOf("Progression"));
+    expect(funnel).toContain("Level 1: 2 players (100%)");
+    expect(funnel).toContain("Level 2: 2 players (100%)");
+  });
+
+  it("shows a level by day and version, with fail reasons and boosters", async () => {
+    await raw({ name: "level_fail", device: "d2", session: "e", ts: at(2, 8, 5), received: at(2, 10), version: "1.1", level: "1", attempt: 2, props: { reason: "out_of_moves" } });
+    await raw({ name: "booster_bought", device: "d2", session: "e", ts: at(2, 8, 6), received: at(2, 10), version: "1.1", level: "1", props: { booster: 2 } });
+    await rollUp(NOW);
+    const html = await (await get(`/level?project=demo&${RANGE}&level=1`)).text();
+    expect(cells(html, "11-01")).toEqual(["11-01", "3", "2", "1", "0", "67%"]);
+    expect(cells(html, "11-03")).toEqual(["11-03", "0", "0", "1", "0", "0%"]);
+    expect(cells(html, "1.1")).toEqual(["1.1", "0", "0", "1", "0", "0%"]);
+    expect(html).toContain("level_fail out_of_moves: 1");
+    expect(html).toContain("booster_bought 2: 1");
+  });
   it("escapes player supplied text", async () => {
     await raw({ name: "tap", device: "d9", session: "x", ts: at(19, 10), props: { note: "<script>alert(1)</script>" } });
     const html = await (await get("/events?project=demo")).text();
     expect(html).not.toContain("<script>alert(1)</script>");
     expect(html).toContain("&lt;script&gt;");
+  });
+});
+
+describe("raw filters, events and device pages", () => {
+  beforeEach(async () => {
+    await createProject();
+    await seed();
+    await rollUp(NOW);
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at(20, 12));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("filters the level table on raw events by device", async () => {
+    const res = await get(`/levels?project=demo&${RANGE}&device=d1`);
+    const html = await res.text();
+    expect(html).toContain("Filtered on raw events");
+    expect(cells(html, "1")).toEqual(["1", "2", "1", "1", "1", "0", "50%", "0%", "2.0", "1m 50s", "3.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "1", "1", "0", "0", "1", "–", "0%", "–", "–", "–", "–"]);
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeGreaterThan(0);
+  });
+
+  it("joins property filters with AND", async () => {
+    const html = await (await get(`/levels?project=demo&${RANGE}&prop=stars%3D3&prop=moves_left%3D2`)).text();
+    expect(cells(html, "1")?.slice(0, 4)).toEqual(["1", "0", "0", "1"]); // only the level_complete matches: no starts, one win
+    expect(cells(html, "2")).toBeUndefined();
+    const none = await (await get(`/levels?project=demo&${RANGE}&prop=stars%3D3&prop=moves_left%3D9`)).text();
+    expect(cells(none, "1")).toBeUndefined();
+  });
+
+  it("caps a raw filtered range at 30 days", async () => {
+    const html = await (await get("/events?project=demo&range=90&device=d1")).text();
+    expect(html).toContain("Filtered on raw events");
+    expect(html).toContain("limited to the last 30 days");
+  });
+
+  it("counts an event over time from rollups and breaks it down by a property on raw events", async () => {
+    const plain = await (await get(`/events?project=demo&${RANGE}&event=session_start`)).text();
+    expect(plain).not.toContain("Filtered on raw events");
+    expect(plain).toContain("2026-11-01: Events 2");
+    expect(plain).toContain("2026-11-03: Events 1");
+    const by = await (await get(`/events?project=demo&${RANGE}&event=level_complete&by=stars`)).text();
+    expect(by).toContain("Filtered on raw events");
+    expect(cells(by, "3")).toEqual(["3", "1"]);
+    expect(cells(by, "1")).toEqual(["1", "1"]);
+  });
+
+  it("filters the raw tail by name and device and links device ids", async () => {
+    const html = await (await get(`/events?project=demo&${RANGE}&event=level_fail`)).text();
+    const tail = html.slice(html.indexOf("Latest events"));
+    expect((tail.match(/<tr><td>/g) ?? []).length).toBe(1);
+    expect(tail).toContain('href="/device?project=demo&amp;range=custom&amp;from=2026-11-01&amp;to=2026-11-03&amp;device=d1"');
+    const d3 = await (await get(`/events?project=demo&${RANGE}&device=d3`)).text();
+    expect((d3.slice(d3.indexOf("Latest events")).match(/<tr><td>/g) ?? []).length).toBe(1);
+  });
+
+  it("shows a device with its days and timeline", async () => {
+    const html = await (await get(`/device?project=demo&${RANGE}&device=d1`)).text();
+    expect(html).toContain("First day 2026-11-01");
+    expect(html).toContain("1.0 · android · ID");
+    expect(html).toContain("Last seen 2026-11-02");
+    expect(cells(html, "11-02")).toEqual(["11-02", "1", "5m 00s", "4", "2"]);
+    expect(cells(html, "11-01")).toEqual(["11-01", "1", "6m 00s", "5", "1"]);
+    const timeline = html.slice(html.indexOf("Timeline"));
+    expect((timeline.match(/<tr><td>/g) ?? []).length).toBe(9);
+    expect(timeline.indexOf("booster_used")).toBeLessThan(timeline.indexOf("session_start"));
   });
 });
 
@@ -171,5 +268,6 @@ describe("reporting time zone", () => {
     expect((await save("project=demo&tz=nope")).status).toBe(400);
     expect((await save("project=demo&tz=60", "https://evil.example")).status).toBe(403);
     expect((await save("project=demo&tz=60&back=//evil.example")).headers.get("Location")).toBe("/");
+    expect((await save("project=demo&tz=60&back=%2F%09%2Fevil.example")).headers.get("Location")).toBe("/");
   });
 });

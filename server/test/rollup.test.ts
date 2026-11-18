@@ -37,14 +37,14 @@ describe("rollup", () => {
       { first_day: "2026-11-01", day: "2026-11-03", version: "1.0", platform: "ios", country: "US", devices: 1 },
       { first_day: "2026-11-02", day: "2026-11-02", version: "1.1", platform: "android", country: "ID", devices: 1 },
     ]);
-    const zero = { starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0 };
+    const zero = { starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
     expect(s.levels).toEqual([
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "android",
-        starts: 2, players: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
+        starts: 2, players: 1, first_starts: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "ios",
-        starts: 1, players: 1, wins: 1, first_try_wins: 1, duration_sum: 60_000, duration_n: 1, stars_sum: 1, stars_n: 1 },
-      { ...zero, project_id: "demo", day: "2026-11-01", level: "2", version: "1.0", platform: "ios", starts: 1, players: 1, quits: 1 },
-      { ...zero, project_id: "demo", day: "2026-11-02", level: "2", version: "1.0", platform: "android", starts: 1, players: 1, quits: 1 },
+        starts: 1, players: 1, first_starts: 1, wins: 1, first_try_wins: 1, duration_sum: 60_000, duration_n: 1, stars_sum: 1, stars_n: 1 },
+      { ...zero, project_id: "demo", day: "2026-11-01", level: "2", version: "1.0", platform: "ios", starts: 1, players: 1, first_starts: 1, quits: 1 },
+      { ...zero, project_id: "demo", day: "2026-11-02", level: "2", version: "1.0", platform: "android", starts: 1, players: 1, first_starts: 1, quits: 1 },
     ]);
     expect(s.events.filter((e) => e.name === "session_start").map((e) => [e.day, e.platform, e.version, e.count, e.devices])).toEqual([
       ["2026-11-01", "android", "1.0", 1, 1], ["2026-11-01", "ios", "1.0", 1, 1],
@@ -105,6 +105,24 @@ describe("rollup", () => {
     expect(s.cohorts.map((c) => [c.first_day, c.day, c.devices])).toEqual([["2026-11-01", "2026-11-01", 1], ["2026-11-01", "2026-11-02", 1]]);
     const p = await env.DB.prepare("SELECT rollup_tz, rebuild_from, rebuild_until FROM projects").first();
     expect(p).toEqual({ rollup_tz: 0, rebuild_from: null, rebuild_until: null });
+  });
+
+  it("counts level events by reason, booster and continue", async () => {
+    const t = at(0, 10);
+    await raw({ name: "level_fail", device: "d1", session: "a", ts: t, level: "3", attempt: 1, props: { reason: "out_of_moves" } });
+    await raw({ name: "level_fail", device: "d2", session: "b", ts: t, level: "3", attempt: 1, props: { reason: "out_of_moves" } });
+    await raw({ name: "level_quit", device: "d1", session: "a", ts: t, level: "3", attempt: 2, props: { via: "menu" } });
+    await raw({ name: "booster_bought", device: "d1", session: "a", ts: t, level: "3", props: { booster: 2 } });
+    await raw({ name: "continue_watched", device: "d1", session: "a", ts: t, level: "3" });
+    await raw({ name: "level_complete", device: "d1", session: "a", ts: t, level: "3", attempt: 3 });
+    await raw({ name: "tap", device: "d1", session: "a", ts: t });
+    await rollUp(NOW);
+    expect(await rows("SELECT name, detail, count FROM level_events ORDER BY name, detail")).toEqual([
+      { name: "booster_bought", detail: "2", count: 1 },
+      { name: "continue_watched", detail: "", count: 1 },
+      { name: "level_fail", detail: "out_of_moves", count: 2 },
+      { name: "level_quit", detail: "menu", count: 1 },
+    ]);
   });
 
   it("keeps every row when many share one arrival time", async () => {

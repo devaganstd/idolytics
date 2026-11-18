@@ -1,12 +1,18 @@
-// Dashboard reads. Every page reads rollup tables only, except the raw tail on the Events page.
-import { DAY } from "./rollup";
+// Dashboard reads. Pages read rollup tables, except the raw filters, the Events tail and the device timeline.
+import { DAY, QUIT_AFTER_MS } from "./rollup";
 
 export interface Filters {
   range: string; from: string; to: string; prevFrom: string; prevTo: string; days: number; compare: boolean;
   v: string | null; p: string | null; c: string | null; who: "all" | "new" | "returning";
+  /** Raw filters: they read the events table. */
+  device: string | null; events: string[]; props: [string, string][]; by: string | null;
+  /** This page reads raw events; capped when the range was cut to RAW_MAX_DAYS. */
+  raw: boolean; capped: boolean;
 }
 export const RANGES: Record<string, string> = { today: "Today", "7": "Last 7 days", "14": "Last 14 days", "30": "Last 30 days", "90": "Last 90 days" };
 const MAX_DAYS = 366;
+export const RAW_MAX_DAYS = 30;
+const KEY = /^[a-z][a-z0-9_]{0,39}$/;
 
 export const addDays = (day: string, n: number) => new Date(Date.parse(day) + n * DAY).toISOString().slice(0, 10);
 const diffDays = (a: string, b: string) => Math.round((Date.parse(b) - Date.parse(a)) / DAY);
@@ -14,8 +20,8 @@ const isDay = (s: string | null): s is string => !!s && /^\d{4}-\d{2}-\d{2}$/.te
   && new Date(Date.parse(s)).toISOString().startsWith(s);
 const opt = (s: string | null) => (s && s.length <= 64 ? s : null);
 
-/** Reads the filter bar from the query string. from = to is one day. */
-export function parseFilters(q: URLSearchParams, today: string): Filters {
+/** Reads the filter bar from the query string. from = to is one day. On a raw page the raw filters cap the range. */
+export function parseFilters(q: URLSearchParams, today: string, rawPage = false): Filters {
   let range = q.get("range") ?? "30";
   let from: string, to: string;
   const qf = q.get("from"), qt = q.get("to");
@@ -29,18 +35,51 @@ export function parseFilters(q: URLSearchParams, today: string): Filters {
     to = today;
     from = range === "today" ? today : addDays(today, -(Number(range) - 1));
   }
+  const device = opt(q.get("device")?.trim() || null);
+  const events = [...new Set(q.getAll("event").flatMap((e) => e.split(",")).map((e) => e.trim()).filter((e) => KEY.test(e)))].slice(0, 10);
+  const props = q.getAll("prop").filter((s) => s.includes("=")).map((s) => {
+    const i = s.indexOf("=");
+    return [s.slice(0, i).trim(), s.slice(i + 1).trim()] as [string, string];
+  }).filter(([k, v]) => KEY.test(k) && v.length <= 100).slice(0, 3);
+  const by = KEY.test(q.get("by") ?? "") ? q.get("by") : null;
+  const raw = rawPage && !!(device || props.length || by);
+  const capped = raw && diffDays(from, to) >= RAW_MAX_DAYS;
+  if (capped) from = addDays(to, -(RAW_MAX_DAYS - 1));
   const days = diffDays(from, to) + 1;
   const who = q.get("who");
   return {
     range, from, to, days, prevTo: addDays(from, -1), prevFrom: addDays(from, -days), compare: q.get("cmp") !== "off",
     v: opt(q.get("v")), p: opt(q.get("p")), c: opt(q.get("c")), who: who === "new" || who === "returning" ? who : "all",
+    device, events, props, by, raw, capped,
   };
+}
+
+/**
+ * WHERE for raw events in the range, by arrival time from the range's first local midnight. Arrival, not device
+ * time, so the events_by_received index bounds the scan. With names, filters on f.events too.
+ * shortcut: a late event counts on its arrival day here; fine for a 30 day debugging window.
+ */
+function rawWhere(project: string, f: Filters, tz: number, names = true) {
+  const start = Date.parse(f.from) - tz * 60_000, end = Date.parse(f.to) + DAY - tz * 60_000;
+  const conds = ["project_id = ?", "received_at >= ?", "received_at < ?"];
+  const binds: unknown[] = [project, start, end];
+  const eq = (col: string, v: string | null) => { if (v !== null) { conds.push(`${col} = ?`); binds.push(v); } };
+  eq("app_version", f.v); eq("platform", f.p); eq("country", f.c); eq("device_id", f.device);
+  if (names && f.events.length) { conds.push(`name IN (${f.events.map(() => "?").join(", ")})`); binds.push(...f.events); }
+  for (const [k, v] of f.props) {
+    conds.push("CAST(json_extract(props, ?) AS TEXT) = ?");
+    binds.push(`$.${k}`, v === "true" ? "1" : v === "false" ? "0" : v);
+  }
+  return { sql: conds.join(" AND "), binds };
 }
 
 interface ActivityRow { day: string; version: string; platform: string; country: string; is_new: number; players: number; sessions: number; playtime: number }
 interface CohortRow { first_day: string; day: string; version: string; platform: string; country: string; devices: number }
 export interface Kpis { dau: number; newUsers: number; sessions: number; sessionLength: number | null; playtimePerUser: number | null; d1: number | null; d7: number | null; stickiness: number | null }
-export interface LevelRow { level: string; starts: number; wins: number; fails: number; quits: number; duration_sum: number; duration_n: number }
+export interface LevelRow {
+  level: string; starts: number; players: number; wins: number; fails: number; quits: number; first_starts: number; first_try_wins: number;
+  duration_sum: number; duration_n: number; stars_sum: number; stars_n: number; moves_left_sum: number; moves_left_n: number;
+}
 
 /** Sum of D1 rows read by a set of results, for the X-D1-Rows-Read header. */
 export const rowsRead = (results: D1Result[]) => results.reduce((n, r) => n + (r.meta.rows_read ?? 0), 0);
@@ -50,7 +89,10 @@ const dims = (f: Filters, r: { version: string; platform: string; country: strin
 const DISTINCT = `SELECT COUNT(DISTINCT device_id) AS n FROM device_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3
   AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5) AND (?6 IS NULL OR country = ?6) AND (?7 IS NULL OR is_new = ?7)`;
 const LEVELS = `SELECT level, SUM(starts) AS starts, SUM(wins) AS wins, SUM(fails) AS fails, SUM(quits) AS quits,
-  SUM(duration_sum) AS duration_sum, SUM(duration_n) AS duration_n
+  SUM(first_starts) AS first_starts,
+  -- Days rolled up before 0.2.1 have first_try_wins but no first_starts; leave them out of the ratio.
+  SUM(CASE WHEN first_starts > 0 THEN first_try_wins ELSE 0 END) AS first_try_wins, SUM(duration_sum) AS duration_sum, SUM(duration_n) AS duration_n,
+  SUM(stars_sum) AS stars_sum, SUM(stars_n) AS stars_n, SUM(moves_left_sum) AS moves_left_sum, SUM(moves_left_n) AS moves_left_n
   FROM level_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5)
   GROUP BY level ORDER BY CAST(level AS INTEGER), level`;
 const TOP_EVENTS = `SELECT name, SUM(count) AS count FROM event_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3
@@ -152,23 +194,133 @@ export async function cohortTable(db: D1Database, project: string, f: Filters, t
   };
 }
 
-export async function levelTable(db: D1Database, project: string, f: Filters) {
-  const res = await db.batch<Record<string, unknown>>([db.prepare(LEVELS).bind(project, f.from, f.to, f.v, f.p)]);
-  return { rowsRead: rowsRead(res), levels: res[0].results as unknown as LevelRow[] };
+// Distinct players who started each level, from the levels each device day saw.
+const LEVEL_PLAYERS = `SELECT j.value AS level, COUNT(DISTINCT dd.device_id) AS players FROM device_days dd, json_each(dd.seen, '$.l') j
+  WHERE dd.project_id = ?1 AND dd.day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR dd.version = ?4) AND (?5 IS NULL OR dd.platform = ?5) GROUP BY j.value`;
+const isMetric = (t: string) => `json_type(props, '$.${t}') IN ('integer', 'real')`;
+// One row per level, device and attempt (session when no attempt), then summed per level, as the rollup counts.
+const RAW_LEVELS = (where: string) => `SELECT level, SUM(s) AS starts, COUNT(DISTINCT CASE WHEN s > 0 THEN device_id END) AS players,
+  SUM(w) AS wins, SUM(fl) AS fails, SUM(q + (s > 0 AND w + fl + q = 0 AND ls < ?)) AS quits,
+  SUM(CASE WHEN a = 1 THEN s ELSE 0 END) AS first_starts, SUM(CASE WHEN a = 1 THEN w ELSE 0 END) AS first_try_wins,
+  TOTAL(ds) AS duration_sum, SUM(dn) AS duration_n, TOTAL(ss) AS stars_sum, SUM(sn) AS stars_n, TOTAL(ms) AS moves_left_sum, SUM(mn) AS moves_left_n
+  FROM (SELECT level, device_id, MAX(attempt) AS a, SUM(name = 'level_start') AS s, SUM(name = 'level_complete') AS w,
+    SUM(name = 'level_fail') AS fl, SUM(name = 'level_quit') AS q, MAX(CASE WHEN name = 'level_start' THEN received_at END) AS ls,
+    SUM(CASE WHEN name <> 'level_start' THEN duration_ms END) AS ds, COUNT(CASE WHEN name <> 'level_start' THEN duration_ms END) AS dn,
+    SUM(CASE WHEN name = 'level_complete' AND ${isMetric("stars")} THEN json_extract(props, '$.stars') END) AS ss,
+    COUNT(CASE WHEN name = 'level_complete' AND ${isMetric("stars")} THEN 1 END) AS sn,
+    SUM(CASE WHEN name = 'level_complete' AND ${isMetric("moves_left")} THEN json_extract(props, '$.moves_left') END) AS ms,
+    COUNT(CASE WHEN name = 'level_complete' AND ${isMetric("moves_left")} THEN 1 END) AS mn
+    FROM events WHERE ${where} AND level IS NOT NULL GROUP BY level, device_id, COALESCE(attempt, session_id))
+  GROUP BY level ORDER BY CAST(level AS INTEGER), level`;
+
+/** All levels with distinct players. Raw filters read the events table instead of level_days. */
+export async function levelTable(db: D1Database, project: string, f: Filters, tz: number, now: number) {
+  if (f.raw) {
+    const w = rawWhere(project, f, tz, false);
+    const res = await db.batch<Record<string, unknown>>([db.prepare(RAW_LEVELS(w.sql)).bind(now - QUIT_AFTER_MS, ...w.binds)]);
+    return { rowsRead: rowsRead(res), levels: res[0].results as unknown as LevelRow[] };
+  }
+  const res = await db.batch<Record<string, unknown>>([
+    db.prepare(LEVELS).bind(project, f.from, f.to, f.v, f.p),
+    db.prepare(LEVEL_PLAYERS).bind(project, f.from, f.to, f.v, f.p),
+  ]);
+  const players = new Map(res[1].results.map((r) => [String(r.level), r.players as number]));
+  const levels = (res[0].results as unknown as LevelRow[]).map((l) => ({ ...l, players: players.get(l.level) ?? 0 }));
+  return { rowsRead: rowsRead(res), levels };
 }
 
-export interface TailRow { client_ts: number; name: string; level: string | null; attempt: number | null; duration_ms: number | null; device_id: string; platform: string | null; props: string | null }
+/** One level by day and by version from level_days, with its fail and quit reasons, boosters and continues. */
+export async function levelDetail(db: D1Database, project: string, f: Filters, level: string) {
+  const res = await db.batch<Record<string, unknown>>([
+    db.prepare(`SELECT day, version, SUM(starts) AS starts, SUM(wins) AS wins, SUM(fails) AS fails, SUM(quits) AS quits FROM level_days
+      WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND level = ?4 AND (?5 IS NULL OR version = ?5) AND (?6 IS NULL OR platform = ?6)
+      GROUP BY day, version`).bind(project, f.from, f.to, level, f.v, f.p),
+    db.prepare(`SELECT name, detail, SUM(count) AS count FROM level_events
+      WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND level = ?4 AND (?5 IS NULL OR version = ?5) AND (?6 IS NULL OR platform = ?6)
+      GROUP BY name, detail ORDER BY count DESC, name, detail LIMIT 30`).bind(project, f.from, f.to, level, f.v, f.p),
+  ]);
+  type Counts = { starts: number; wins: number; fails: number; quits: number };
+  const rows = res[0].results as unknown as (Counts & { day: string; version: string })[];
+  const group = (key: "day" | "version") => {
+    const m = new Map<string, Counts>();
+    for (const r of rows) {
+      const g = m.get(r[key]) ?? { starts: 0, wins: 0, fails: 0, quits: 0 };
+      for (const k of ["starts", "wins", "fails", "quits"] as const) g[k] += r[k];
+      m.set(r[key], g);
+    }
+    return [...m].map(([key, c]) => ({ key, ...c }));
+  };
+  return {
+    rowsRead: rowsRead(res),
+    byDay: group("day").sort((a, b) => b.key.localeCompare(a.key)),
+    byVersion: group("version").sort((a, b) => b.key.localeCompare(a.key, "en", { numeric: true })),
+    events: res[1].results as unknown as { name: string; detail: string; count: number }[],
+  };
+}
 
-/** The only raw read: the newest events by arrival, on the Events page. */
-export async function eventsPage(db: D1Database, project: string, f: Filters) {
+export interface TailRow {
+  client_ts: number; name: string; level: string | null; attempt: number | null; duration_ms: number | null;
+  device_id: string; app_version: string | null; platform: string | null; props: string | null;
+}
+const TAIL = "SELECT client_ts, name, level, attempt, duration_ms, device_id, app_version, platform, props FROM events";
+
+/**
+ * Events over time and the newest raw events. The chart reads event_days unless a raw filter or a breakdown is set.
+ * The tail is the 100 newest matching rows: any date when nothing filters it, else in the range.
+ */
+export async function eventsPage(db: D1Database, project: string, f: Filters, tz: number) {
+  const w = rawWhere(project, f, tz);
+  // An event filter alone reads rollups for the chart; its raw tail still keeps to the last RAW_MAX_DAYS days.
+  const tw = f.raw ? w : rawWhere(project, { ...f, from: f.days > RAW_MAX_DAYS ? addDays(f.to, -(RAW_MAX_DAYS - 1)) : f.from }, tz);
+  const conds = ["project_id = ?", "day BETWEEN ? AND ?"], binds: unknown[] = [project, f.from, f.to];
+  if (f.v) { conds.push("version = ?"); binds.push(f.v); }
+  if (f.p) { conds.push("platform = ?"); binds.push(f.p); }
+  if (f.events.length) { conds.push(`name IN (${f.events.map(() => "?").join(", ")})`); binds.push(...f.events); }
+  const filtered = f.raw || f.events.length > 0;
   const res = await db.batch<Record<string, unknown>>([
     db.prepare(TOP_EVENTS).bind(project, f.from, f.to, f.v, f.p),
-    db.prepare(`SELECT client_ts, name, level, attempt, duration_ms, device_id, platform, props
-      FROM events WHERE project_id = ? ORDER BY received_at DESC LIMIT 50`).bind(project),
+    f.raw
+      ? db.prepare(`SELECT strftime('%Y-%m-%d', (received_at + ?) / 1000, 'unixepoch') AS day, COUNT(*) AS n FROM events WHERE ${w.sql} GROUP BY day`)
+        .bind(tz * 60_000, ...w.binds)
+      : db.prepare(`SELECT day, SUM(count) AS n FROM event_days WHERE ${conds.join(" AND ")} GROUP BY day`).bind(...binds),
+    filtered
+      ? db.prepare(`${TAIL} WHERE ${tw.sql} ORDER BY received_at DESC LIMIT 100`).bind(...tw.binds)
+      : db.prepare(`${TAIL} WHERE project_id = ? ORDER BY received_at DESC LIMIT 100`).bind(project),
+    ...(f.by ? [db.prepare(`SELECT CAST(json_extract(props, ?) AS TEXT) AS prop, COUNT(*) AS n FROM events WHERE ${w.sql}
+      GROUP BY prop ORDER BY n DESC, prop LIMIT 20`).bind(`$.${f.by}`, ...w.binds)] : []),
   ]);
+  const perDay = new Map(res[1].results.map((r) => [String(r.day), r.n as number]));
+  const days = Array.from({ length: f.days }, (_, i) => addDays(f.from, i));
   return {
     rowsRead: rowsRead(res),
     topEvents: res[0].results as unknown as { name: string; count: number }[],
-    tail: res[1].results as unknown as TailRow[],
+    days, counts: days.map((d) => perDay.get(d) ?? 0),
+    tail: res[2].results as unknown as TailRow[], filtered,
+    breakdown: f.by ? res[3].results as unknown as { prop: string | null; n: number }[] : null,
+  };
+}
+
+/** One device: its install, its days in the range and its raw events newest first. */
+export async function devicePage(db: D1Database, project: string, f: Filters, tz: number, device: string) {
+  const days = Array.from({ length: f.days }, (_, i) => addDays(f.from, i));
+  // Version, platform and country do not filter this page: device_days rows carry them per day, not per event.
+  const w = rawWhere(project, { ...f, device, v: null, p: null, c: null, events: [], props: [] }, tz);
+  const res = await db.batch<Record<string, unknown>>([
+    db.prepare("SELECT first_day, version, platform, country FROM devices WHERE project_id = ? AND device_id = ?").bind(project, device),
+    // One primary key lookup per day; this page has at most RAW_MAX_DAYS days.
+    db.prepare(`SELECT day, sessions, playtime_ms, events, seen FROM device_days WHERE project_id = ? AND device_id = ?
+      AND day IN (${days.map(() => "?").join(", ")}) ORDER BY day DESC`).bind(project, device, ...days),
+    // shortcut: no device index, so this scans the range's raw rows by arrival; add (project_id, device_id, received_at) if it gets slow.
+    db.prepare(`${TAIL} WHERE ${w.sql} ORDER BY received_at DESC LIMIT 200`).bind(...w.binds),
+  ]);
+  return {
+    rowsRead: rowsRead(res),
+    device: (res[0].results[0] ?? null) as { first_day: string; version: string; platform: string; country: string } | null,
+    days: res[1].results.map((r) => {
+      const levels = (JSON.parse(r.seen as string).l as string[]).map(Number).filter(Number.isFinite);
+      return { day: r.day as string, sessions: r.sessions as number, playtime: r.playtime_ms as number, events: r.events as number,
+        level: levels.length ? Math.max(...levels) : null };
+    }),
+    timeline: res[2].results as unknown as TailRow[],
   };
 }
