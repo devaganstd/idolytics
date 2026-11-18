@@ -43,3 +43,4 @@ Thumbs.db
 server/wrangler.local.jsonc
 server/.admin-key.local
 server/.*-write-key.local
+NINJA_SMASH_PROMPT.md
