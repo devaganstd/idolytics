@@ -69,6 +69,8 @@ Sessions and the install id are automatic. Press Play, finish a level, wait ten 
 
 Reload the server URL. You see daily players and sessions, the level table, the levels where players quit, booster use and the latest events.
 
+Dates and times show in UTC until you pick a time zone in the page header, such as UTC+7 (WIB). The choice is a fixed offset with no daylight saving, and it is kept in a cookie in your browser. The daily event cap still resets at UTC midnight.
+
 ## Local development
 
 ```bash

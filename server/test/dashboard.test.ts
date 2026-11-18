@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env, exports } from "cloudflare:workers";
-import { boosters, levelStats } from "../src/queries";
+import { tzLabel, tzOffset } from "../src/dashboard";
+import { boosters, daily, DAY, levelStats, RANGE_DAYS } from "../src/queries";
 import { BASE, batch, createProject, ev, post, reset, store } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
@@ -103,6 +104,59 @@ describe("booster use", () => {
     const b = await boosters(env.DB, "demo", Date.now());
     expect(b.byBooster).toEqual([{ label: "booster_bought 2", count: 2 }, { label: "try_taken 1", count: 1 }]);
     expect(b.byDay).toEqual([{ label: new Date().toISOString().slice(0, 10), count: 3 }]);
+  });
+});
+
+describe("time zone", () => {
+  const today = Math.floor(Date.now() / DAY) * DAY;
+  const evening = today - DAY + 18 * 3_600_000; // yesterday 18:00 UTC
+  const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+
+  it("buckets an 18:00 UTC event into the next day at UTC+7", async () => {
+    await store({ name: "session_start", device: "d1", session: "s1", level: "1", ts: evening, received: evening });
+    expect((await daily(env.DB, "demo", Date.now(), 0))[0].day).toBe(iso(evening));
+    expect((await daily(env.DB, "demo", Date.now(), 420))[0].day).toBe(iso(today));
+  });
+
+  it("starts the range at local midnight", async () => {
+    const now = today + 12 * 3_600_000;
+    const firstLocalDay = today - (RANGE_DAYS - 1) * DAY - 420 * 60_000; // 00:00 UTC+7, 29 days back
+    await store({ name: "session_start", device: "in", session: "a", level: "1", ts: firstLocalDay, received: now });
+    await store({ name: "session_start", device: "out", session: "b", level: "1", ts: firstLocalDay - 1, received: now });
+    expect(await daily(env.DB, "demo", now, 420)).toEqual([{ day: iso(today - (RANGE_DAYS - 1) * DAY), players: 1, sessions: 1 }]);
+  });
+
+  it("parses tz from the query or cookie and falls back to UTC", () => {
+    const tz = (q: string, cookie = "") => tzOffset(new Request(`${BASE}/${q}`, { headers: { Cookie: cookie } }));
+    expect(tz("?tz=420")).toBe(420);
+    expect(tz("?tz=-480")).toBe(-480);
+    expect(tz("", "a=1; tz=330")).toBe(330);
+    expect(tz("?tz=420", "tz=60")).toBe(420);
+    for (const bad of ["?tz=abc", "?tz=841", "?tz=-721", "?tz=7.5", "?tz=", "?tz=0x1a4"]) expect(tz(bad)).toBe(0);
+    expect(tz("", "tz=9999")).toBe(0);
+    expect(tzLabel(0)).toBe("UTC");
+    expect(tzLabel(420)).toBe("UTC+7");
+    expect(tzLabel(330)).toBe("UTC+5:30");
+    expect(tzLabel(-480)).toBe("UTC-8");
+  });
+
+  it("stores the choice in a cookie and shows local times", async () => {
+    await createProject();
+    await store({ name: "level_start", device: "d1", session: "s1", level: "1", ts: evening, received: evening });
+    const res = await get("/?project=demo&tz=420");
+    expect(res.headers.get("Set-Cookie")).toMatch(/^tz=420; Path=\/; Max-Age=31536000; SameSite=Lax/);
+    const html = await res.text();
+    expect(html).toContain("Times in UTC+7");
+    expect(html).toContain('<option value="420" selected>UTC+7 (WIB)</option>');
+    expect(html).toContain(new Date(evening + 7 * 3_600_000).toISOString().slice(5, 16).replace("T", " "));
+    expect(await (await get("/?project=demo", { ...AUTH, Cookie: "tz=420" })).text()).toContain("Times in UTC+7");
+  });
+
+  it("falls back to UTC for an invalid tz", async () => {
+    await createProject();
+    const res = await get("/?project=demo&tz=nope");
+    expect(res.headers.get("Set-Cookie")).toMatch(/^tz=0;/);
+    expect(await res.text()).toContain("Times in UTC.");
   });
 });
 

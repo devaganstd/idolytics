@@ -25,6 +25,24 @@ export async function checkAdmin(request: Request, env: Env): Promise<Response |
   return new Response("Admin key required", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="idolytics", charset="UTF-8"' } });
 }
 
+// shortcut: fixed offsets only, no DST; switch to IANA zones if a DST-region studio adopts it
+const TZ_CHOICES = [...Array.from({ length: 21 }, (_, i) => (i - 8) * 60), 330].sort((a, b) => a - b);
+const TZ_NAMES: Record<number, string> = { 420: "WIB", 480: "WITA", 540: "WIT" };
+
+/** Dashboard offset in minutes east of UTC: ?tz= first, then the tz cookie. Anything but an integer in -720..840 is UTC. */
+export function tzOffset(request: Request): number {
+  const q = new URL(request.url).searchParams.get("tz");
+  const raw = q ?? /(?:^|;\s*)tz=([^;]*)/.exec(request.headers.get("Cookie") ?? "")?.[1] ?? "";
+  const n = /^-?\d{1,3}$/.test(raw) ? Number(raw) : 0;
+  return n >= -720 && n <= 840 ? n : 0;
+}
+
+export function tzLabel(min: number): string {
+  if (!min) return "UTC";
+  const a = Math.abs(min);
+  return `UTC${min < 0 ? "-" : "+"}${Math.floor(a / 60)}${a % 60 ? ":" + String(a % 60).padStart(2, "0") : ""}`;
+}
+
 export async function createProject(request: Request, env: Env): Promise<Response> {
   if (request.headers.get("Origin") !== new URL(request.url).origin) return new Response("Cross origin form refused", { status: 403 });
   const form = await request.formData();
@@ -47,19 +65,30 @@ export async function createProject(request: Request, env: Env): Promise<Respons
 
 export async function dashboard(request: Request, env: Env): Promise<Response> {
   const all = await projects(env.DB);
-  const wanted = new URL(request.url).searchParams.get("project");
+  const params = new URL(request.url).searchParams;
+  const wanted = params.get("project");
   const current = all.find((p) => p.id === wanted) ?? all[0];
+  const tz = tzOffset(request);
+  const zone = tzLabel(tz);
+  const tzForm = `<form method="get" action="/" class="tz">${current ? `<input type="hidden" name="project" value="${esc(current.id)}">` : ""}
+    <label>Time zone <select name="tz">${[...new Set([...TZ_CHOICES, tz])].sort((a, b) => a - b).map((m) =>
+      `<option value="${m}"${m === tz ? " selected" : ""}>${tzLabel(m)}${TZ_NAMES[m] ? ` (${TZ_NAMES[m]})` : ""}</option>`).join("")}</select></label>
+    <button>Apply</button></form>`;
+  const done = (res: Response) => {
+    if (params.has("tz")) res.headers.append("Set-Cookie", `tz=${tz}; Path=/; Max-Age=31536000; SameSite=Lax; Secure; HttpOnly`);
+    return res;
+  };
   const nav = all.map((p) => `<a href="/?project=${encodeURIComponent(p.id)}"${p === current ? ' aria-current="page"' : ""}>${esc(p.name)}</a>`).join("");
   const newForm = `<details${all.length ? "" : " open"}><summary>New project</summary>
     <form method="post" action="/projects"><label>Id <input name="id" required maxlength="40" placeholder="my-game"></label>
     <label>Name <input name="name" maxlength="80" placeholder="My Game"></label><button>Create</button></form></details>`;
-  if (!current) return page("idolytics", `<section><p>No projects yet. Create one to get a write key.</p>${newForm}</section>`);
+  if (!current) return done(page("idolytics", `<section><p>No projects yet. Create one to get a write key.</p>${newForm}</section>`, 200, tzForm));
 
   const now = Date.now();
   const [days, levels, boost, events] = await Promise.all([
-    daily(env.DB, current.id, now),
+    daily(env.DB, current.id, now, tz),
     levelStats(env.DB, current.id, now),
-    boosters(env.DB, current.id, now),
+    boosters(env.DB, current.id, now, tz),
     tail(env.DB, current.id),
   ]);
   const pct = (v: number | null) => (v === null ? "–" : `${Math.round(v * 100)}%`);
@@ -70,14 +99,14 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   const levelRows = levels.map((l) => `<tr><td>${esc(l.level)}</td>
     <td><span class="meter" style="width:${Math.round((l.starts / maxStarts) * 48)}px"></span>${l.starts}</td>
     <td>${l.wins}</td><td>${l.losses}</td><td>${pct(l.winRate)}</td><td>${num(l.attemptsPerWin)}</td><td>${l.quits}</td></tr>`).join("");
-  const tailRows = events.map((e) => `<tr><td>${new Date(e.client_ts).toISOString().slice(5, 19).replace("T", " ")}</td>
+  const tailRows = events.map((e) => `<tr><td>${new Date(e.client_ts + tz * 60_000).toISOString().slice(5, 19).replace("T", " ")}</td>
     <td>${esc(e.name)}</td><td>${esc(e.level)}</td><td>${esc(e.attempt)}</td>
     <td>${e.duration_ms === null ? "" : (e.duration_ms / 1000).toFixed(1) + " s"}</td>
     <td title="${esc(e.platform)}">${esc(e.device_id.slice(0, 8))}</td><td><code>${esc(e.props)}</code></td></tr>`).join("");
 
   const body = `<nav>${nav}${newForm}</nav>
   <section><h2>Daily players and sessions</h2>
-    <p class="note">Last ${RANGE_DAYS} days by device date (UTC). Players are distinct install ids.</p>
+    <p class="note">Last ${RANGE_DAYS} days by device date. Times in ${zone}. Players are distinct install ids.</p>
     ${lineChart(days.map((d) => d.day), [
       { name: "Players", cls: "s1", values: days.map((d) => d.players) },
       { name: "Sessions", cls: "s2", values: days.map((d) => d.sessions) },
@@ -93,17 +122,17 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     ${barList(quits.map((l) => ({ label: `Level ${l.level}`, value: l.quits })))}</section>
   <section><h2>Booster use</h2><p class="note">Counts booster_used, booster_bought and try_taken, by event and booster.</p>
     ${barList(boost.byBooster.map((b) => ({ label: b.label, value: b.count })))}
-    <h3>Per day</h3>
+    <h3>Per day</h3><p class="note">Times in ${zone}.</p>
     ${lineChart(boost.byDay.map((d) => d.label), [{ name: "Boosters", cls: "s1", values: boost.byDay.map((d) => d.count) }])}</section>
   <section><h2>Latest events</h2>
-    <div class="scroll"><table class="tail"><thead><tr><th>Time (UTC)</th><th>Event</th><th>Level</th><th>Attempt</th><th>Duration</th><th>Device</th><th>Props</th></tr></thead>
+    <div class="scroll"><table class="tail"><thead><tr><th>Time (${zone})</th><th>Event</th><th>Level</th><th>Attempt</th><th>Duration</th><th>Device</th><th>Props</th></tr></thead>
     <tbody>${tailRows || `<tr><td colspan="7" class="empty">No events yet.</td></tr>`}</tbody></table></div></section>`;
-  return page(`idolytics: ${current.name}`, body);
+  return done(page(`idolytics: ${current.name}`, body, 200, tzForm));
 }
 
-function page(title: string, body: string, status = 200): Response {
+function page(title: string, body: string, status = 200, tools = ""): Response {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>${esc(title)}</title><style>${CSS}</style></head><body><header><h1>${esc(title)}</h1></header><main>${body}</main></body></html>`;
+<title>${esc(title)}</title><style>${CSS}</style></head><body><header><h1>${esc(title)}</h1>${tools}</header><main>${body}</main></body></html>`;
   return new Response(html, { status, headers: HEADERS });
 }
 
@@ -113,6 +142,8 @@ const CSS = `
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:15px/1.45 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif}
 header,main{max-width:960px;margin:0 auto;padding:0 16px}
+header{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:end;justify-content:space-between;margin-bottom:8px}
+form.tz{margin:0}select{font:inherit;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);min-height:40px}
 h1{font-size:20px;margin:16px 0 8px}h2{font-size:17px;margin:0 0 4px}h3{font-size:14px;margin:16px 0 4px;color:var(--muted)}
 section{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px;margin:0 0 16px}
 nav{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:0 0 16px}

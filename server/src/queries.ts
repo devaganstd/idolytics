@@ -10,11 +10,17 @@ export async function projects(db: D1Database) {
   return (await db.prepare("SELECT id, name FROM projects ORDER BY created_at").all<{ id: string; name: string }>()).results;
 }
 
-export async function daily(db: D1Database, project: string, now: number) {
+/** Start of the range: local midnight RANGE_DAYS - 1 days before today, as epoch ms. offsetMin is minutes east of UTC. */
+export function rangeStart(now: number, offsetMin: number) {
+  const off = offsetMin * 60_000;
+  return Math.floor((now + off) / DAY) * DAY - (RANGE_DAYS - 1) * DAY - off;
+}
+
+export async function daily(db: D1Database, project: string, now: number, offsetMin = 0) {
   return (await db.prepare(
-    `SELECT date(client_ts / 1000, 'unixepoch') AS day, COUNT(DISTINCT device_id) AS players, COUNT(DISTINCT session_id) AS sessions
+    `SELECT date((client_ts + ?) / 1000, 'unixepoch') AS day, COUNT(DISTINCT device_id) AS players, COUNT(DISTINCT session_id) AS sessions
      FROM events WHERE project_id = ? AND client_ts >= ? GROUP BY day ORDER BY day`,
-  ).bind(project, now - RANGE_DAYS * DAY).all<{ day: string; players: number; sessions: number }>()).results;
+  ).bind(offsetMin * 60_000, project, rangeStart(now, offsetMin)).all<{ day: string; players: number; sessions: number }>()).results;
 }
 
 export async function levelStats(db: D1Database, project: string, now: number): Promise<LevelStat[]> {
@@ -42,9 +48,9 @@ export async function levelStats(db: D1Database, project: string, now: number): 
   }));
 }
 
-export async function boosters(db: D1Database, project: string, now: number) {
+export async function boosters(db: D1Database, project: string, now: number, offsetMin = 0) {
   const marks = BOOSTER_EVENTS.map(() => "?").join(", ");
-  const since = now - RANGE_DAYS * DAY;
+  const since = rangeStart(now, offsetMin);
   // Two grouped queries in one round trip; a single (day, label) scan would return rows without bound.
   const [byBooster, byDay] = await db.batch<{ label: string; count: number }>([
     db.prepare(
@@ -53,10 +59,10 @@ export async function boosters(db: D1Database, project: string, now: number) {
        GROUP BY label ORDER BY count DESC LIMIT 12`,
     ).bind(project, since, ...BOOSTER_EVENTS),
     db.prepare(
-      `SELECT date(client_ts / 1000, 'unixepoch') AS label, COUNT(*) AS count
+      `SELECT date((client_ts + ?) / 1000, 'unixepoch') AS label, COUNT(*) AS count
        FROM events WHERE project_id = ? AND client_ts >= ? AND name IN (${marks})
        GROUP BY label ORDER BY label`,
-    ).bind(project, since, ...BOOSTER_EVENTS),
+    ).bind(offsetMin * 60_000, project, since, ...BOOSTER_EVENTS),
   ]);
   return { byBooster: byBooster.results, byDay: byDay.results };
 }
