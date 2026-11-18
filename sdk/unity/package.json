@@ -1,7 +1,7 @@
 {
   "name": "com.idolytics.unity",
   "displayName": "idolytics",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "unity": "2021.3",
   "description": "Game analytics SDK for a self-hosted idolytics server.",
   "license": "MIT",

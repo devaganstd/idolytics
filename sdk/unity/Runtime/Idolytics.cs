@@ -11,7 +11,7 @@ namespace IdolyticsSdk
     /// </summary>
     public static class Idolytics
     {
-        internal const string SdkVersion = "unity/0.1.1";
+        internal const string SdkVersion = "unity/0.1.2";
         const string InstallIdKey = "idolytics.install_id";
         const string QueueKey = "idolytics.queue";
         const float SaveInterval = 2;
@@ -171,13 +171,9 @@ namespace IdolyticsSdk
         static void AutoInit()
         {
             if (Settings != null) return;
+            // No asset is normal: many games call Init(settings) themselves after the first scene.
             var settings = Resources.Load<IdolyticsSettings>("IdolyticsSettings");
-            if (settings == null)
-            {
-                Debug.LogWarning("[idolytics] No Resources/IdolyticsSettings asset; events are queued but not sent until Idolytics.Init(settings) is called.");
-                return;
-            }
-            Init(settings);
+            if (settings != null) Init(settings);
         }
 
         // Statics survive play mode in the Editor when domain reload is off.
