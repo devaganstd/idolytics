@@ -29,7 +29,9 @@ Idolytics.Track("level_complete", new Dictionary<string, object>
 ```
 
 `level`, `attempt`, `duration_ms`, `value` and `currency` become event fields; other keys go to `props` (string, bool or number).
-A `session_start` event is sent at launch and after 30 s in the background. Events are queued in `PlayerPrefs` (up to 1,000) and sent in batches.
+A `session_start` event is sent at launch and after 30 s in the background. Events are queued in `PlayerPrefs` (up to 1,000 events or about 256 KB; the oldest are dropped first) and sent in batches of up to 100 events and 60 KB. Prop strings longer than 100 characters are cut, and a negative `duration_ms` is left out.
+
+The queue is saved at most every 2 s after `Track`, and when the app pauses or loses focus. On WebGL, closing the tab does not run `OnApplicationQuit`, so events tracked in the last 2 s before the tab closes can be lost.
 
 The Ninja Smash sample (Package Manager > Samples) is a complete adapter from a game's own analytics interface.
 

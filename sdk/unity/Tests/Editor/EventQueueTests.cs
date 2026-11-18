@@ -51,7 +51,7 @@ namespace IdolyticsSdk.Tests
             var q = new EventQueue();
             foreach (var s in items) q.Enqueue(s);
 
-            var restored = EventQueue.Restore(q.Serialize(), 1000);
+            var restored = EventQueue.Restore(q.Serialize(), 1000, out _);
 
             CollectionAssert.AreEqual(items, restored.Peek(10));
         }
@@ -64,7 +64,7 @@ namespace IdolyticsSdk.Tests
             q.Enqueue("b");
             q.Enqueue("c");
 
-            CollectionAssert.AreEqual(new[] { "b", "c" }, EventQueue.Restore(q.Serialize(), 2).Peek(10));
+            CollectionAssert.AreEqual(new[] { "b", "c" }, EventQueue.Restore(q.Serialize(), 2, out _).Peek(10));
         }
 
         [TestCase(null)]
@@ -75,7 +75,95 @@ namespace IdolyticsSdk.Tests
         [TestCase("[\"a\" \"b\"]")]
         public void RestoreOfBadDataReturnsEmptyQueue(string data)
         {
-            Assert.AreEqual(0, EventQueue.Restore(data, 1000).Count);
+            var q = EventQueue.Restore(data, 1000, out bool unreadable);
+            Assert.AreEqual(0, q.Count);
+            Assert.AreEqual(!string.IsNullOrEmpty(data), unreadable);
+        }
+
+        [Test]
+        public void ByteCapDropsOldestButKeepsNewest()
+        {
+            var q = new EventQueue(1000, 10);
+            q.Enqueue("aaaa");
+            q.Enqueue("bbbb");
+            q.Enqueue("cccc");
+
+            CollectionAssert.AreEqual(new[] { "bbbb", "cccc" }, q.Peek(10));
+            Assert.AreEqual(8, q.Bytes);
+            Assert.AreEqual(1, q.Dropped);
+
+            q.Enqueue("this one is larger than the cap");
+            Assert.AreEqual(1, q.Count);
+            q.Remove(1);
+            Assert.AreEqual(0, q.Bytes);
+        }
+
+        [Test]
+        public void BytesCountUtf8()
+        {
+            var q = new EventQueue();
+            q.Enqueue("é日");
+            Assert.AreEqual(5, q.Bytes);
+        }
+    }
+
+    public class IdolyticsSenderTests
+    {
+        UnityEngine.GameObject go;
+        IdolyticsSender sender;
+
+        [SetUp]
+        public void SetUp()
+        {
+            go = new UnityEngine.GameObject("sender-test");
+            sender = go.AddComponent<IdolyticsSender>();
+        }
+
+        [TearDown]
+        public void TearDown() => UnityEngine.Object.DestroyImmediate(go);
+
+        [Test]
+        public void FitStopsAtByteBudgetAndKeepsAtLeastOne()
+        {
+            var events = new[] { "aaaa", "bbbb", "cccc" };
+            Assert.AreEqual(2, IdolyticsSender.Fit(events, 10));
+            Assert.AreEqual(3, IdolyticsSender.Fit(events, 15));
+            Assert.AreEqual(1, IdolyticsSender.Fit(events, 2));
+        }
+
+        [Test]
+        public void SuccessAcksAndRestoresBatchSize()
+        {
+            sender.maxBatch = 12;
+            sender.backoff = 8;
+            Assert.IsTrue(sender.OnResponse(200, 12, ""));
+            Assert.AreEqual(IdolyticsSender.MaxEvents, sender.maxBatch);
+            Assert.AreEqual(0, sender.backoff);
+        }
+
+        [TestCase(400)]
+        [TestCase(413)]
+        public void RejectedBatchIsHalvedThenOnlyOneEventDropped(long code)
+        {
+            Assert.IsFalse(sender.OnResponse(code, 100, ""));
+            Assert.AreEqual(50, sender.maxBatch);
+            Assert.IsFalse(sender.OnResponse(code, 2, ""));
+            Assert.AreEqual(1, sender.maxBatch);
+            Assert.IsTrue(sender.OnResponse(code, 1, ""));
+            Assert.AreEqual(0, sender.backoff);
+        }
+
+        [TestCase(401)]
+        [TestCase(403)]
+        [TestCase(429)]
+        [TestCase(500)]
+        [TestCase(0)]
+        public void OtherFailuresKeepTheQueueAndBackOff(long code)
+        {
+            Assert.IsFalse(sender.OnResponse(code, 1, ""));
+            Assert.AreEqual(2, sender.backoff);
+            Assert.IsFalse(sender.OnResponse(code, 1, ""));
+            Assert.AreEqual(4, sender.backoff);
         }
     }
 
@@ -126,6 +214,27 @@ namespace IdolyticsSdk.Tests
                 "{\"event_id\":\"e1\",\"name\":\"x\",\"ts\":1,\"session_id\":\"s1\"," +
                 "\"props\":{\"text\":\"a\\\"b\\\\c\\nd\\u0001\",\"other\":\"1.2\"}}",
                 EventBuilder.Build("x", props, "s1", 1, "e1"));
+        }
+
+        [Test]
+        public void NegativeDurationIsLeftOut()
+        {
+            Assert.AreEqual(
+                "{\"event_id\":\"e1\",\"name\":\"x\",\"ts\":1,\"session_id\":\"s1\"}",
+                EventBuilder.Build("x", new Dictionary<string, object> { { "duration_ms", -5L } }, "s1", 1, "e1"));
+        }
+
+        [Test]
+        public void LongPropStringsAreCutTo100WithoutSplittingPairs()
+        {
+            string json = EventBuilder.Build("x", new Dictionary<string, object>
+            {
+                { "a", new string('a', 150) },
+                { "b", new string('b', 99) + "😀" },
+            }, "s1", 1, "e1");
+
+            StringAssert.Contains("\"a\":\"" + new string('a', 100) + "\"", json);
+            StringAssert.Contains("\"b\":\"" + new string('b', 99) + "\"", json);
         }
 
         [Test]

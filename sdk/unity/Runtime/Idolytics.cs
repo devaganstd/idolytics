@@ -11,14 +11,19 @@ namespace IdolyticsSdk
     /// </summary>
     public static class Idolytics
     {
-        internal const string SdkVersion = "unity/0.1.0";
+        internal const string SdkVersion = "unity/0.1.1";
         const string InstallIdKey = "idolytics.install_id";
         const string QueueKey = "idolytics.queue";
+        const float SaveInterval = 2;
 
         internal static IdolyticsSettings Settings;
         static IdolyticsSender sender;
         static EventQueue queue;
         static string installId;
+        static float lastSave = float.NegativeInfinity;
+
+        /// <summary>True when events were queued since the last save.</summary>
+        internal static bool Dirty { get; private set; }
 
         public static string SessionId { get; private set; }
 
@@ -40,7 +45,18 @@ namespace IdolyticsSdk
             }
         }
 
-        internal static EventQueue Queue => queue ?? (queue = EventQueue.Restore(PlayerPrefs.GetString(QueueKey), 1000));
+        internal static EventQueue Queue
+        {
+            get
+            {
+                if (queue == null)
+                {
+                    queue = EventQueue.Restore(PlayerPrefs.GetString(QueueKey), 1000, out bool unreadable);
+                    if (unreadable) Debug.LogWarning("[idolytics] The saved event queue was unreadable and was discarded.");
+                }
+                return queue;
+            }
+        }
 
         internal static bool CanSend =>
             Settings != null && !string.IsNullOrEmpty(Settings.endpoint) && (!Application.isEditor || Settings.sendInEditor);
@@ -76,6 +92,7 @@ namespace IdolyticsSdk
             }
             if (SessionId == null) StartSession();
             Enqueue(name, props);
+            SaveThrottled();
         }
 
         /// <summary>Sends the next batch now instead of waiting for the interval.</summary>
@@ -99,6 +116,18 @@ namespace IdolyticsSdk
         {
             PlayerPrefs.SetString(QueueKey, Queue.Serialize());
             PlayerPrefs.Save();
+            lastSave = Time.realtimeSinceStartup;
+            Dirty = false;
+        }
+
+        /// <summary>
+        /// Saves at most once every 2 s; the sender saves the rest when the interval ends. WebGL never
+        /// calls OnApplicationQuit, so this bounds what a closed tab loses.
+        /// </summary>
+        internal static void SaveThrottled()
+        {
+            if (Time.realtimeSinceStartup - lastSave >= SaveInterval) Save();
+            else Dirty = true;
         }
 
         internal static string Envelope(IReadOnlyList<string> events)
@@ -159,6 +188,8 @@ namespace IdolyticsSdk
             sender = null;
             queue = null;
             SessionId = null;
+            lastSave = float.NegativeInfinity;
+            Dirty = false;
         }
     }
 }

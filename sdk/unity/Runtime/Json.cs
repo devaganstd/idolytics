@@ -39,19 +39,26 @@ namespace IdolyticsSdk
             return v != null;
         }
 
-        /// <summary>Writes a string, bool or number; anything else as its ToString().</summary>
-        public static void Value(StringBuilder sb, object v)
+        /// <summary>Writes a string, bool or number; anything else as its ToString(). Strings are cut to <paramref name="maxString"/> UTF-16 units.</summary>
+        public static void Value(StringBuilder sb, object v, int maxString)
         {
             switch (v)
             {
-                case string s: String(sb, s); break;
+                case string s: String(sb, Cut(s, maxString)); break;
                 case bool b: sb.Append(b ? "true" : "false"); break;
                 case double d: sb.Append(d.ToString("R", Inv)); break;
                 case float f: sb.Append(f.ToString("R", Inv)); break;
                 case int _: case long _: case short _: case byte _: case sbyte _: case uint _: case ulong _: case ushort _: case decimal _:
                     sb.Append(Convert.ToString(v, Inv)); break;
-                default: String(sb, v.ToString()); break;
+                default: String(sb, Cut(v.ToString() ?? "", maxString)); break;
             }
+        }
+
+        static string Cut(string s, int max)
+        {
+            if (s.Length <= max) return s;
+            // Never split a surrogate pair: half of one is not valid UTF-8.
+            return s.Substring(0, char.IsHighSurrogate(s[max - 1]) ? max - 1 : max);
         }
 
         /// <summary>Parses a JSON array of strings; null when the text is anything else.</summary>

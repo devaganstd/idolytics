@@ -23,12 +23,19 @@ namespace NinjaSmash.Services
     {
         [SerializeField] IdolyticsSettings settings;
 
-        // Per level: the attempt and start time from its last level_start.
-        readonly Dictionary<string, (int attempt, float start)> starts = new Dictionary<string, (int attempt, float start)>();
+        // Per level: the attempt, start time and paused total from its last level_start.
+        readonly Dictionary<string, (int attempt, float start, float paused)> starts = new Dictionary<string, (int attempt, float start, float paused)>();
+
+        // Time spent in the background, so durations count play time only.
+        float pausedTotal;
+        float pausedAt = -1;
 
         public override void Initialize(ServiceContext context, Action<bool> done)
         {
             starts.Clear();
+            // Focus loss also fires on mobile pause and WebGL tab switch; a ScriptableObject gets no OnApplicationPause.
+            Application.focusChanged -= OnFocusChanged;
+            Application.focusChanged += OnFocusChanged;
             Idolytics.Init(settings);
             context.Hub.SetAnalytics(this);
             done(true);
@@ -51,12 +58,16 @@ namespace NinjaSmash.Services
             if (key1 != null) p[key1] = value1;
             if (key2 != null) p[key2] = value2;
             if (key3 != null) p[key3] = value3;
-            string level = p.TryGetValue("level", out object l) ? Convert.ToString(l, CultureInfo.InvariantCulture) : "";
+            // No level: no attempt or duration, since they are keyed by level.
+            string level = p.TryGetValue("level", out object l) && l != null ? Convert.ToString(l, CultureInfo.InvariantCulture) : null;
 
             switch (name)
             {
                 case "level_start":
-                    starts[level] = (p.TryGetValue("attempt", out object a) ? Convert.ToInt32(a, CultureInfo.InvariantCulture) : 0, Time.realtimeSinceStartup);
+                    if (level == null) break;
+                    int attempt = p.TryGetValue("attempt", out object a) && int.TryParse(Convert.ToString(a, CultureInfo.InvariantCulture),
+                        NumberStyles.Integer, CultureInfo.InvariantCulture, out int n) ? n : 0;
+                    starts[level] = (attempt, Time.realtimeSinceStartup, pausedTotal);
                     break;
                 case "level_win":
                     name = "level_complete";
@@ -78,10 +89,21 @@ namespace NinjaSmash.Services
 
         void AddAttemptAndDuration(Dictionary<string, object> p, string level)
         {
-            if (!starts.TryGetValue(level, out var start)) return;
+            if (level == null || !starts.TryGetValue(level, out var start)) return;
+            starts.Remove(level);
             p["attempt"] = start.attempt;
-            // shortcut: realtimeSinceStartup includes paused time, accepted for 0.1; subtract pauses to fix.
-            p["duration_ms"] = (long)((Time.realtimeSinceStartup - start.start) * 1000);
+            float played = Time.realtimeSinceStartup - start.start - (pausedTotal - start.paused);
+            p["duration_ms"] = (long)(Math.Max(0, played) * 1000);
+        }
+
+        void OnFocusChanged(bool focused)
+        {
+            if (!focused && pausedAt < 0) pausedAt = Time.realtimeSinceStartup;
+            else if (focused && pausedAt >= 0)
+            {
+                pausedTotal += Time.realtimeSinceStartup - pausedAt;
+                pausedAt = -1;
+            }
         }
 
         static void Move(Dictionary<string, object> p, string from, string to)

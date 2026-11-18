@@ -13,6 +13,9 @@ namespace IdolyticsSdk
     {
         static readonly CultureInfo Inv = CultureInfo.InvariantCulture;
 
+        /// <summary>The server rejects an event with a longer prop string, so longer ones are cut.</summary>
+        internal const int MaxPropString = 100;
+
         public static string Build(string name, IDictionary<string, object> props, string sessionId, long ts, string eventId)
         {
             var sb = new StringBuilder(160);
@@ -35,7 +38,8 @@ namespace IdolyticsSdk
                     lifted.Add("level");
                 }
                 if (Number(props, "attempt", lifted, out double attempt)) sb.Append(",\"attempt\":").Append(((int)attempt).ToString(Inv));
-                if (Number(props, "duration_ms", lifted, out double duration)) sb.Append(",\"duration_ms\":").Append(((long)duration).ToString(Inv));
+                // A negative duration (clock change, bad game math) is sent as no duration; the server rejects it.
+                if (Number(props, "duration_ms", lifted, out double duration) && duration >= 0) sb.Append(",\"duration_ms\":").Append(((long)duration).ToString(Inv));
                 if (Number(props, "value", lifted, out double value)) sb.Append(",\"value\":").Append(value.ToString("R", Inv));
                 if (props.TryGetValue("currency", out object currency) && currency != null)
                 {
@@ -52,7 +56,7 @@ namespace IdolyticsSdk
                     first = false;
                     Json.String(sb, kv.Key);
                     sb.Append(':');
-                    Json.Value(sb, kv.Value);
+                    Json.Value(sb, kv.Value, MaxPropString);
                 }
                 if (!first) sb.Append('}');
             }
