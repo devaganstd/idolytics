@@ -1,0 +1,40 @@
+# AI tooling and owner working files stay local, never in the repository
+BRIEF.md
+SESSION_PROMPT.md
+CLAUDE.md
+CLAUDE.local.md
+AGENTS.md
+GEMINI.md
+.claude/
+.agents/
+.codex/
+.cursor/
+.cursorrules
+.windsurf/
+.gemini/
+skills/
+.mcp.json
+.playwright-mcp/
+
+# Node and Wrangler
+node_modules/
+.wrangler/
+dist/
+*.log
+
+# Secrets
+.dev.vars
+.env
+
+# Unity (when the SDK is opened as a project)
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

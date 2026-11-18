@@ -41,6 +41,7 @@ sdk/unity/              UPM package com.idolytics.unity (MIT, own LICENSE.md)
    - Note: the game sends 17 names, not 16. `continue_bought` (level, price) was missed by the `Log("` grep because the call spans two lines.
 9. **Offline queue** lives in `PlayerPrefs` as JSON, capped at 1,000 events (oldest dropped). `PlayerPrefs` persists on WebGL (IndexedDB) without the file system sync that `persistentDataPath` needs.
 10. **Settings asset** is loaded from `Resources/IdolyticsSettings`; `Idolytics.Init(settings)` overrides it.
+11. **C# namespace is `IdolyticsSdk`** (decided during the build): a static class `Idolytics` inside a namespace `Idolytics` breaks `Idolytics.Track` in scripts without a namespace, which is most Unity scripts.
 
 ## Checklist
 
