@@ -153,6 +153,16 @@ A daily rollup is cut at midnight of one time zone. Rolling up by hour would cos
 
 The 0.1.3 time zone selector becomes this project setting. A change applies to new rollups at once, and the cron rebuilds the last 90 days from the raw rows.
 
+### 5.3 Test and live keys
+
+Each project gets a second write key for test builds, so test plays never mix with live data and games no longer share the `smoke-test` project. Added by the owner on 2026-11-18 for v0.2.2.
+
+- **Keys table.** A new `keys` table holds `(key_hash, project_id, env)`, where `env` is `live` or `test`. The migration copies every existing `write_key_hash` in as a `live` key, so every key already shipped in a build keeps working with no game update.
+- **Storage.** A test key writes to a hidden sibling project, `<id>~test`, created with the test key. Events and rollups need no new column, and the cron, the usage cap and the raw retention treat the sibling like any project.
+- **Dashboard.** Each project page has a Live and Test switch, with Live as the default. The sibling never shows in the project list.
+- **Settings.** Create or rotate the test key from the project settings. The key is shown once, as on project creation.
+- **SDK.** No change. A game puts the test key in its Editor or development `IdolyticsSettings` asset.
+
 ## 6. Out of scope for v0.2
 
 - Segments and audiences.
@@ -171,6 +181,6 @@ The 0.1.3 time zone selector becomes this project setting. A change applies to n
 |---|---|---|
 | A | Rollup tables, cron, watermark, raw retention, filter bar, Overview with compare, Retention | The numbers match a hand count on seeded data, and a dashboard load reads no raw rows |
 | B | Levels page upgrade, progression funnel, level detail, Events page, raw filters (device, event, property), Device page | Ninja Smash smoke data shows correct win, quit and first try rates |
-| C | Economy and ads module, Live, Settings with usage meter | Modules hide when their events are absent |
+| C | Economy and ads module, Live, Settings with usage meter, test and live keys (section 5.3) | Modules hide when their events are absent; an old live key still ingests, and a test key's events show only under Test |
 
 Each phase is one release: v0.2.0, v0.2.1 and v0.2.2. None changes the SDK or the HTTP API, so games need no update.
