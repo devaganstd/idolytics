@@ -16,7 +16,7 @@ About ten minutes from nothing to your first event. You need Node.js 20 or newer
 ### 1. Deploy the server
 
 ```bash
-git clone https://github.com/<org>/idolytics.git
+git clone https://github.com/devaganstd/idolytics.git
 cd idolytics/server
 npm install
 npx wrangler login
@@ -42,7 +42,7 @@ Open the server URL. The browser asks for a user name and password: type any use
 Window > Package Manager > + > Add package from git URL:
 
 ```
-https://github.com/<org>/idolytics.git?path=/sdk/unity
+https://github.com/devaganstd/idolytics.git?path=/sdk/unity
 ```
 
 ### 4. Configure

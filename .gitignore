@@ -38,3 +38,8 @@ dist/
 Thumbs.db
 .vscode/
 .idea/
+
+# Owner deploy config with real account and D1 ids, and the admin key
+server/wrangler.local.jsonc
+server/.admin-key.local
+server/.*-write-key.local

@@ -7,7 +7,7 @@ Sends game events to your self-hosted idolytics server. Unity 2021.3 or newer, n
 Package Manager > Add package from git URL:
 
 ```
-https://github.com/<org>/idolytics.git?path=/sdk/unity
+https://github.com/devaganstd/idolytics.git?path=/sdk/unity
 ```
 
 ## Set up

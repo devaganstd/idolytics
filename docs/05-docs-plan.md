@@ -80,7 +80,7 @@ Open source game analytics you host yourself. See where players clear, fail and 
 
 1. Press Deploy to Cloudflare and open the URL it gives you.
 2. Create the owner account and a project. Copy the write key.
-3. In Unity, add `https://github.com/<org>/idolytics-unity.git` in the Package Manager.
+3. In Unity, add `https://github.com/devaganstd/idolytics-unity.git` in the Package Manager.
 4. Create a idolytics Settings asset, paste the URL and the key.
 5. Call `Idolytics.LevelStart("1")` and `Idolytics.LevelComplete("1")`. Press Play.
 
@@ -131,7 +131,7 @@ Press New project, give it a name. Copy the write key now: it is shown once.
 
 Window > Package Manager > + > Add package from git URL:
 
-    https://github.com/<org>/idolytics-unity.git
+    https://github.com/devaganstd/idolytics-unity.git
 
 ## 5. Configure
 

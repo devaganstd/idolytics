@@ -11,7 +11,7 @@ Prerequisites: a Cloudflare account (free plan is enough), a Unity 2021.3 or new
 | 1 | Open the idolytics repository and press **Deploy to Cloudflare**. Sign in, keep the default names, press Deploy. Cloudflare forks the repository, creates the Worker and the D1 database, and runs the migrations. | 2 min |
 | 2 | Cloudflare shows the Worker URL, for example `https://idolytics.<account>.workers.dev`. Open it. The setup page asks for the bootstrap token printed in the deploy log and an email and password for the owner account. | 1 min |
 | 3 | Create a project: name `My Game`, slug `my-game`. The page shows the write key once and a ready to paste config. | 1 min |
-| 4 | In Unity: Window, Package Manager, Add package from git URL: `https://github.com/<org>/idolytics-unity.git`. | 1 min |
+| 4 | In Unity: Window, Package Manager, Add package from git URL: `https://github.com/devaganstd/idolytics-unity.git`. | 1 min |
 | 5 | Assets, Create, idolytics, Settings. Paste the endpoint URL and the write key. Leave "Send in Editor" on. | 1 min |
 | 6 | Add three calls to the game: `Idolytics.LevelStart("1")`, `Idolytics.LevelComplete("1", moves: 7, stars: 3)` and `Idolytics.LevelFail("1", reason: "out_of_moves")`. Sessions are automatic. | 2 min |
 | 7 | Press Play, start and finish a level. Open the dashboard: the Live panel shows the events within seconds, Levels shows level 1. | 1 min |
@@ -21,7 +21,7 @@ Total: about 9 minutes. A custom domain is optional: Workers settings, Domains, 
 Docker alternative (v1):
 
 ```bash
-git clone https://github.com/<org>/idolytics && cd idolytics
+git clone https://github.com/devaganstd/idolytics && cd idolytics
 cp .env.example .env    # set ADMIN_BOOTSTRAP_TOKEN and SECRET_KEY
 docker compose up -d    # SQLite in ./data; set DATABASE_URL for Postgres
 ```
