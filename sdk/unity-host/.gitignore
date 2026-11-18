@@ -1,0 +1,8 @@
+# IDE files Unity generates
+*.csproj
+*.sln
+*.slnx
+# Written by the Editor on open; not used by the host
+Assets/Resources/
+Assets/Resources.meta
+Builds/

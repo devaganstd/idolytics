@@ -32,3 +32,19 @@ Idolytics.Track("level_complete", new Dictionary<string, object>
 A `session_start` event is sent at launch and after 30 s in the background. Events are queued in `PlayerPrefs` (up to 1,000) and sent in batches.
 
 The Ninja Smash sample (Package Manager > Samples) is a complete adapter from a game's own analytics interface.
+
+## Developing the SDK
+
+`sdk/unity-host/` is a minimal Unity 6000.3 project that references this package from disk (`file:../../unity`) and lists it in `testables`. Run the EditMode tests headless (Windows path shown; `-runTests` exits by itself, so do not add `-quit`):
+
+```
+"C:\Program Files\Unity\Hub\Editor\6000.3.22f1\Editor\Unity.exe" -batchmode -nographics -projectPath sdk/unity-host -runTests -testPlatform EditMode -testResults results.xml -logFile unity.log
+```
+
+Exit code 0 means all tests passed; failures are in `results.xml`. Check that the package builds for WebGL (needs the WebGL module):
+
+```
+"C:\Program Files\Unity\Hub\Editor\6000.3.22f1\Editor\Unity.exe" -batchmode -nographics -quit -projectPath sdk/unity-host -buildTarget WebGL -executeMethod HostBuild.WebGL -buildPath <out-dir> -logFile build.log
+```
+
+The host compiles a copy of `Samples~/NinjaSmash` in `Assets/NinjaSmashCheck/` against stub Ninja Smash service types, because Unity never compiles `Samples~`. A host test fails when the copy differs from the sample, so copy the file again after editing the sample.
