@@ -154,6 +154,18 @@ describe("reporting time zone", () => {
     expect(html).toContain("midnight to midnight in UTC+7");
   });
 
+  it("accepts a same-origin browser post that sends Origin: null, and refuses Origin: null alone", async () => {
+    await createProject();
+    const post = (extra: Record<string, string>) => exports.default.fetch(new Request(`${BASE}/settings/tz`, {
+      method: "POST", redirect: "manual",
+      headers: { ...AUTH, Origin: "null", "Content-Type": "application/x-www-form-urlencoded", ...extra }, body: "project=demo&tz=420",
+    }));
+    expect((await post({})).status).toBe(403);
+    expect((await post({ "Sec-Fetch-Site": "cross-site" })).status).toBe(403);
+    expect((await post({ "Sec-Fetch-Site": "same-origin" })).status).toBe(303);
+    expect(await env.DB.prepare("SELECT tz_min FROM projects").first()).toEqual({ tz_min: 420 });
+  });
+
   it("refuses an invalid zone, a cross origin post and an outside redirect", async () => {
     await createProject();
     expect((await save("project=demo&tz=nope")).status).toBe(400);

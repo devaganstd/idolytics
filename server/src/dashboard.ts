@@ -9,7 +9,8 @@ const HEADERS = {
   "Cache-Control": "no-store",
   "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
   "X-Content-Type-Options": "nosniff",
-  "Referrer-Policy": "no-referrer",
+  // same-origin, not no-referrer: with no-referrer browsers send Origin: null on the dashboard's own form posts.
+  "Referrer-Policy": "same-origin",
 };
 
 /** HTTP Basic: any user name, the admin key as password. Returns null when authorised. */
@@ -26,7 +27,9 @@ export async function checkAdmin(request: Request, env: Env): Promise<Response |
   return new Response("Admin key required", { status: 401, headers: { "WWW-Authenticate": 'Basic realm="idolytics", charset="UTF-8"' } });
 }
 
-const sameOrigin = (request: Request) => request.headers.get("Origin") === new URL(request.url).origin;
+/** A form post from this dashboard: the browser says same-origin, or the Origin matches. Origin: null alone is refused. */
+const sameOrigin = (request: Request) =>
+  request.headers.get("Sec-Fetch-Site") === "same-origin" || request.headers.get("Origin") === new URL(request.url).origin;
 
 export async function createProject(request: Request, env: Env): Promise<Response> {
   if (!sameOrigin(request)) return new Response("Cross origin form refused", { status: 403 });
