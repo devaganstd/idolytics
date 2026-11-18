@@ -1,4 +1,5 @@
 import { env, exports } from "cloudflare:workers";
+import { INSERT_EVENT } from "../src/ingest";
 import { sha256Hex } from "../src/keys";
 
 export const WRITE_KEY = "idl_w_testkeytestkeytestkeytestkey";
@@ -39,5 +40,13 @@ export async function rows(sql = "SELECT * FROM events ORDER BY client_ts, event
 }
 
 export async function reset() {
-  await env.DB.batch([env.DB.prepare("DELETE FROM events"), env.DB.prepare("DELETE FROM projects")]);
+  await env.DB.batch(["events", "projects", "usage"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
+}
+
+let raw = 0;
+/** Inserts a stored row directly, to control received_at. */
+export async function store(e: { name: string; device: string; session: string; level: string; attempt?: number | null; ts: number; received: number }) {
+  await env.DB.prepare(INSERT_EVENT)
+    .bind("demo", `raw-${++raw}`, e.name, e.device, e.session, null, e.ts, e.received, null, null, null, null, e.level, e.attempt ?? null, null, null, null, null)
+    .run();
 }

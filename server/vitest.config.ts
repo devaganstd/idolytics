@@ -8,6 +8,7 @@ export default defineConfig({
       miniflare: {
         bindings: {
           ADMIN_KEY: "test-admin-key",
+          DAILY_EVENT_CAP: "50",
           TEST_MIGRATIONS: await readD1Migrations("./migrations"),
         },
       },

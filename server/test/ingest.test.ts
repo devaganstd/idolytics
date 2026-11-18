@@ -73,13 +73,9 @@ describe("POST /v1/events", () => {
       ev({ event_id: undefined }),
       ev({ ts: undefined }),
       ev({ session_id: undefined }),
-      ev({ ts: now - 31 * 86_400_000 }),
-      ev({ ts: now + 2 * 86_400_000 }),
       ev({ props: Object.fromEntries(Array.from({ length: 26 }, (_, i) => [`k${i}`, i])) }),
       ev({ props: { nested: { a: 1 } } }),
       ev({ props: { list: [1, 2] } }),
-      ev({ duration_ms: -5 }),
-      ev({ attempt: 1.5 }),
       ev({ props: { long: "x".repeat(101) } }),
       ev({ props: { email: "a" } }),
       ev({ props: { name: "Budi" } }),
@@ -95,6 +91,33 @@ describe("POST /v1/events", () => {
     expect(await res.json()).toEqual({ accepted: 1, rejected: bad.length });
     const r = await rows();
     expect(r.map((x) => x.name)).toEqual(["custom_ok"]);
+  });
+
+  it("keeps events with bad optional numbers or clock, fixing the field", async () => {
+    const now = Date.now();
+    const res = await post(batch([
+      ev({ event_id: "neg", duration_ms: -5, attempt: 2 }),
+      ev({ event_id: "frac", attempt: 1.5, duration_ms: "slow" }),
+      ev({ event_id: "past", ts: now - 31 * 86_400_000 }),
+      ev({ event_id: "future", ts: now + 2 * 86_400_000 }),
+    ]));
+    expect(await res.json()).toEqual({ accepted: 4, rejected: 0 });
+    const r = Object.fromEntries((await rows()).map((x) => [x.event_id, x]));
+    expect(r.neg).toMatchObject({ duration_ms: null, attempt: 2 });
+    expect(r.frac).toMatchObject({ duration_ms: null, attempt: null });
+    for (const id of ["past", "future"]) expect(r[id].client_ts).toBe(r[id].received_at);
+  });
+
+  it("answers 429 and stores nothing once the project hits its daily cap", async () => {
+    // vitest.config.ts sets DAILY_EVENT_CAP to 50.
+    const full = await post(batch(Array.from({ length: 50 }, () => ev())));
+    expect(full.status).toBe(202);
+    const over = await post(batch([ev()]));
+    expect(over.status).toBe(429);
+    const retry = Number(over.headers.get("Retry-After"));
+    expect(retry).toBeGreaterThan(0);
+    expect(retry).toBeLessThanOrEqual(86_400);
+    expect(await rows()).toHaveLength(50);
   });
 
   it("never stores the IP address", async () => {

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env, exports } from "cloudflare:workers";
-import { levelStats } from "../src/queries";
-import { BASE, batch, createProject, ev, post, reset } from "./helpers";
+import { boosters, levelStats } from "../src/queries";
+import { BASE, batch, createProject, ev, post, reset, store } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
 const get = (path: string, headers: Record<string, string> = AUTH) =>
@@ -52,32 +52,57 @@ describe("projects", () => {
 });
 
 describe("level stats", () => {
-  it("matches a hand count, inferring quits only for stale unclosed starts", async () => {
-    await createProject();
-    const now = Date.now();
-    const old = now - 60 * 60_000;
-    await post(batch([
-      ev({ name: "level_start", level: "1", session_id: "s1", ts: old }),
-      ev({ name: "level_fail", level: "1", session_id: "s1", ts: old + 1 }),
-      ev({ name: "level_start", level: "1", session_id: "s1", ts: old + 2, attempt: 2 }),
-      ev({ name: "level_complete", level: "1", session_id: "s1", ts: old + 3, attempt: 2 }),
-    ], { device_id: "d1" }));
-    await post(batch([
-      ev({ name: "level_start", level: "1", session_id: "s2", ts: old }),
-      ev({ name: "level_complete", level: "1", session_id: "s2", ts: old + 1 }),
-      ev({ name: "level_start", level: "2", session_id: "s2", ts: old + 2 }),
-    ], { device_id: "d2" }));
-    await post(batch([ev({ name: "level_start", level: "2", session_id: "s3", ts: now - 5 * 60_000 })], { device_id: "d3" }));
-    await post(batch([
-      ev({ name: "level_start", level: "2", session_id: "s4", ts: old }),
-      ev({ name: "level_quit", level: "2", session_id: "s4", ts: old + 1 }),
-    ], { device_id: "d4" }));
+  const now = Date.now();
+  const old = now - 60 * 60_000;
+  const at = (min: number) => now - min * 60_000;
 
-    const stats = await levelStats(env.DB, "demo", now);
-    expect(stats).toEqual([
+  it("matches a hand count, inferring quits only for stale unclosed starts", async () => {
+    // d1: fails attempt 1, wins attempt 2. d2: wins level 1, leaves level 2 an hour ago.
+    // d3: started level 2 five minutes ago (still playing). d4: quits level 2 explicitly.
+    for (const e of [
+      { name: "level_start", device: "d1", level: "1", attempt: 1 }, { name: "level_fail", device: "d1", level: "1", attempt: 1 },
+      { name: "level_start", device: "d1", level: "1", attempt: 2 }, { name: "level_complete", device: "d1", level: "1", attempt: 2 },
+      { name: "level_start", device: "d2", level: "1", attempt: 1 }, { name: "level_complete", device: "d2", level: "1", attempt: 1 },
+      { name: "level_start", device: "d2", level: "2", attempt: 1 },
+      { name: "level_start", device: "d4", level: "2", attempt: 1 }, { name: "level_quit", device: "d4", level: "2", attempt: 1 },
+    ]) await store({ ...e, session: "s-" + e.device, ts: old, received: old });
+    await store({ name: "level_start", device: "d3", session: "s3", level: "2", attempt: 1, ts: at(5), received: at(5) });
+
+    expect(await levelStats(env.DB, "demo", now)).toEqual([
       { level: "1", starts: 3, wins: 2, losses: 1, quits: 0, winRate: 2 / 3, attemptsPerWin: 1.5 },
       { level: "2", starts: 3, wins: 0, losses: 0, quits: 2, winRate: null, attemptsPerWin: null },
     ]);
+  });
+
+  it("ages a start by when the server received it, not by the device clock", async () => {
+    // Device clock 20 hours ahead; the start reached the server two hours ago and was never closed.
+    await store({ name: "level_start", device: "d1", session: "s1", level: "5", attempt: 1, ts: now + 20 * 3_600_000, received: at(120) });
+    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "5", starts: 1, quits: 1 });
+  });
+
+  it("keeps unclosed starts without an attempt apart by session", async () => {
+    await store({ name: "level_start", device: "d1", session: "a", level: "4", attempt: null, ts: at(90), received: at(90) });
+    await store({ name: "level_start", device: "d1", session: "b", level: "4", attempt: null, ts: at(5), received: at(5) });
+    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "4", starts: 2, quits: 1 });
+  });
+
+  it("does not count a level resumed and finished in a new session as a quit", async () => {
+    await store({ name: "level_start", device: "d1", session: "old", level: "3", attempt: 1, ts: at(90), received: at(90) });
+    await store({ name: "level_complete", device: "d1", session: "new", level: "3", attempt: 1, ts: at(10), received: at(10) });
+    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "3", starts: 1, wins: 1, quits: 0 });
+  });
+});
+
+describe("booster use", () => {
+  it("totals by booster and by day", async () => {
+    await createProject();
+    await post(batch([
+      ev({ name: "booster_bought", props: { booster: 2 } }), ev({ name: "booster_bought", props: { booster: 2 } }),
+      ev({ name: "try_taken", props: { booster: 1 } }), ev({ name: "level_start" }),
+    ]));
+    const b = await boosters(env.DB, "demo", Date.now());
+    expect(b.byBooster).toEqual([{ label: "booster_bought 2", count: 2 }, { label: "try_taken 1", count: 1 }]);
+    expect(b.byDay).toEqual([{ label: new Date().toISOString().slice(0, 10), count: 3 }]);
   });
 });
 

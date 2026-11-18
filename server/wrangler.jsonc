@@ -3,6 +3,8 @@
   "name": "idolytics",
   "main": "src/index.ts",
   "compatibility_date": "2026-11-01",
+  // Events accepted per project per UTC day; ingest answers 429 above it.
+  "vars": { "DAILY_EVENT_CAP": "20000" },
   "d1_databases": [
     {
       "binding": "DB",

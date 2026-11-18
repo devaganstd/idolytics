@@ -23,12 +23,13 @@ export async function levelStats(db: D1Database, project: string, now: number): 
        SELECT level,
          SUM(name = 'level_start') AS s, SUM(name = 'level_complete') AS w,
          SUM(name = 'level_fail') AS l, SUM(name = 'level_quit') AS q,
-         -- MIN with received_at: a device clock running ahead cannot keep a start open for a day.
-         MAX(CASE WHEN name = 'level_start' THEN MIN(client_ts, received_at) END) AS last_start
+         -- received_at, not the device clock, which can be a day off.
+         MAX(CASE WHEN name = 'level_start' THEN received_at END) AS last_start
        FROM events
        WHERE project_id = ? AND level IS NOT NULL AND client_ts >= ?
          AND name IN ('level_start', 'level_complete', 'level_fail', 'level_quit')
-       GROUP BY level, device_id, session_id)
+       -- By attempt, not session, so a level resumed after a restart still closes; session only when attempt is missing.
+       GROUP BY level, device_id, COALESCE(attempt, session_id))
      SELECT level, SUM(s) AS starts, SUM(w) AS wins, SUM(l) AS losses,
        SUM(q + CASE WHEN last_start < ? THEN MAX(0, s - w - l - q) ELSE 0 END) AS quits
      FROM g GROUP BY level
@@ -44,6 +45,7 @@ export async function levelStats(db: D1Database, project: string, now: number): 
 export async function boosters(db: D1Database, project: string, now: number) {
   const marks = BOOSTER_EVENTS.map(() => "?").join(", ");
   const since = now - RANGE_DAYS * DAY;
+  // Two grouped queries in one round trip; a single (day, label) scan would return rows without bound.
   const [byBooster, byDay] = await db.batch<{ label: string; count: number }>([
     db.prepare(
       `SELECT name || ' ' || COALESCE(json_extract(props, '$.booster'), '?') AS label, COUNT(*) AS count
@@ -59,11 +61,11 @@ export async function boosters(db: D1Database, project: string, now: number) {
   return { byBooster: byBooster.results, byDay: byDay.results };
 }
 
-export interface TailRow { received_at: number; name: string; level: string | null; attempt: number | null; duration_ms: number | null; device_id: string; platform: string | null; props: string | null }
+export interface TailRow { client_ts: number; name: string; level: string | null; attempt: number | null; duration_ms: number | null; device_id: string; platform: string | null; props: string | null }
 
 export async function tail(db: D1Database, project: string) {
   return (await db.prepare(
-    `SELECT received_at, name, level, attempt, duration_ms, device_id, platform, props
-     FROM events WHERE project_id = ? ORDER BY received_at DESC, client_ts DESC LIMIT 50`,
+    `SELECT client_ts, name, level, attempt, duration_ms, device_id, platform, props
+     FROM events WHERE project_id = ? ORDER BY client_ts DESC LIMIT 50`,
   ).bind(project).all<TailRow>()).results;
 }

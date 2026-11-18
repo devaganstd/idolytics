@@ -2,6 +2,7 @@ import { sha256Hex } from "./keys";
 
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_EVENTS = 100;
+export const DEFAULT_DAILY_CAP = 20_000;
 const NAME = /^[a-z][a-z0-9_]{0,39}$/;
 const DAY = 86_400_000;
 // Keys that would carry personal data. Allows keys such as step_name or level_name.
@@ -37,22 +38,27 @@ function validProps(p: unknown): p is Props {
 export function toRow(e: any, now: number): Row | null {
   if (!e || typeof e !== "object") return null;
   if (!str(e.event_id, 64) || !str(e.name, 40) || !NAME.test(e.name) || e.name.startsWith("idl_")) return null;
-  if (!isInt(e.ts) || e.ts < now - 30 * DAY || e.ts > now + DAY) return null;
+  if (!isInt(e.ts)) return null;
   if (!str(e.session_id, 64) || !optStr(e.user_id, 64) || !optStr(e.currency, 16)) return null;
   if (typeof e.user_id === "string" && LOOKS_LIKE_EMAIL.test(e.user_id)) return null;
   const level = typeof e.level === "number" && isInt(e.level) ? String(e.level) : e.level;
   if (!optStr(level, 40)) return null;
-  if (e.attempt != null && !nonNegInt(e.attempt)) return null;
-  if (e.duration_ms != null && !nonNegInt(e.duration_ms)) return null;
   if (e.value != null && !(typeof e.value === "number" && Number.isFinite(e.value))) return null;
   if (!validProps(e.props)) return null;
   const hasProps = e.props && Object.keys(e.props).length > 0;
   return {
-    event_id: e.event_id, name: e.name, session_id: e.session_id, user_id: e.user_id ?? null, client_ts: e.ts,
-    level: level ?? null, attempt: e.attempt ?? null, duration_ms: e.duration_ms ?? null,
+    // A device clock far off would put the event on the wrong day; use the server time instead.
+    client_ts: e.ts < now - 30 * DAY || e.ts > now + DAY ? now : e.ts,
+    event_id: e.event_id, name: e.name, session_id: e.session_id, user_id: e.user_id ?? null,
+    // A bad optional number loses that field, not the whole event.
+    level: level ?? null, attempt: nonNegInt(e.attempt) ? e.attempt : null, duration_ms: nonNegInt(e.duration_ms) ? e.duration_ms : null,
     value: e.value ?? null, currency: e.currency ?? null, props: hasProps ? JSON.stringify(e.props) : null,
   };
 }
+
+export const INSERT_EVENT = `INSERT OR IGNORE INTO events (project_id, event_id, name, device_id, session_id, user_id,
+  client_ts, received_at, app_version, platform, os, country, level, attempt, duration_ms, value, currency, props)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`;
 
 export async function ingest(request: Request, env: Env): Promise<Response> {
   const auth = request.headers.get("Authorization") ?? "";
@@ -63,9 +69,19 @@ export async function ingest(request: Request, env: Env): Promise<Response> {
   const buf = await request.arrayBuffer();
   if (buf.byteLength > MAX_BODY_BYTES) return json({ error: "body too large" }, 413);
 
-  const project = await env.DB.prepare("SELECT id FROM projects WHERE write_key_hash = ?")
-    .bind(await sha256Hex(key)).first<{ id: string }>();
+  const now = Date.now();
+  const day = new Date(now).toISOString().slice(0, 10);
+  const project = await env.DB.prepare(
+    `SELECT p.id, COALESCE(u.events, 0) AS used FROM projects p
+     LEFT JOIN usage u ON u.project_id = p.id AND u.day = ? WHERE p.write_key_hash = ?`,
+  ).bind(day, await sha256Hex(key)).first<{ id: string; used: number }>();
   if (!project) return json({ error: "unknown write key" }, 401);
+  // Checked before the batch: requests in flight at the same time can each pass it by one batch.
+  const cap = Number(env.DAILY_EVENT_CAP);
+  if (project.used >= (Number.isFinite(cap) && cap >= 0 && env.DAILY_EVENT_CAP ? cap : DEFAULT_DAILY_CAP)) {
+    const toMidnight = Math.ceil((Date.parse(day) + DAY - now) / 1000);
+    return Response.json({ error: "daily event cap reached" }, { status: 429, headers: { ...CORS, "Retry-After": String(toMidnight) } });
+  }
 
   let body: any;
   try { body = JSON.parse(new TextDecoder().decode(buf)); } catch { return json({ error: "invalid JSON" }, 400); }
@@ -73,20 +89,20 @@ export async function ingest(request: Request, env: Env): Promise<Response> {
   if (!str(body.device_id, 64)) return json({ error: "device_id is required" }, 400);
   for (const f of ["app_version", "platform", "os"]) if (!optStr(body[f], 64)) return json({ error: `invalid ${f}` }, 400);
 
-  const now = Date.now();
   const rows = body.events.map((e: unknown) => toRow(e, now)).filter((r: Row | null): r is Row => r !== null);
   const country = (request as { cf?: { country?: string } }).cf?.country ?? null;
-  const stmt = env.DB.prepare(
-    `INSERT OR IGNORE INTO events (project_id, event_id, name, device_id, session_id, user_id, client_ts, received_at,
-      app_version, platform, os, country, level, attempt, duration_ms, value, currency, props)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-  );
+  const stmt = env.DB.prepare(INSERT_EVENT);
   if (rows.length) {
-    await env.DB.batch(rows.map((r: Row) => stmt.bind(
-      project.id, r.event_id, r.name, body.device_id, r.session_id, r.user_id, r.client_ts, now,
-      body.app_version ?? null, body.platform ?? null, body.os ?? null, country,
-      r.level, r.attempt, r.duration_ms, r.value, r.currency, r.props,
-    )));
+    await env.DB.batch([
+      ...rows.map((r: Row) => stmt.bind(
+        project.id, r.event_id, r.name, body.device_id, r.session_id, r.user_id, r.client_ts, now,
+        body.app_version ?? null, body.platform ?? null, body.os ?? null, country,
+        r.level, r.attempt, r.duration_ms, r.value, r.currency, r.props,
+      )),
+      // Counts accepted events, so a replayed batch counts again; fine for an abuse cap.
+      env.DB.prepare(`INSERT INTO usage (project_id, day, events) VALUES (?, ?, ?)
+        ON CONFLICT (project_id, day) DO UPDATE SET events = events + excluded.events`).bind(project.id, day, rows.length),
+    ]);
   }
   return json({ accepted: rows.length, rejected: body.events.length - rows.length }, 202);
 }

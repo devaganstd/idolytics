@@ -70,7 +70,7 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   const levelRows = levels.map((l) => `<tr><td>${esc(l.level)}</td>
     <td><span class="meter" style="width:${Math.round((l.starts / maxStarts) * 48)}px"></span>${l.starts}</td>
     <td>${l.wins}</td><td>${l.losses}</td><td>${pct(l.winRate)}</td><td>${num(l.attemptsPerWin)}</td><td>${l.quits}</td></tr>`).join("");
-  const tailRows = events.map((e) => `<tr><td>${new Date(e.received_at).toISOString().slice(5, 19).replace("T", " ")}</td>
+  const tailRows = events.map((e) => `<tr><td>${new Date(e.client_ts).toISOString().slice(5, 19).replace("T", " ")}</td>
     <td>${esc(e.name)}</td><td>${esc(e.level)}</td><td>${esc(e.attempt)}</td>
     <td>${e.duration_ms === null ? "" : (e.duration_ms / 1000).toFixed(1) + " s"}</td>
     <td title="${esc(e.platform)}">${esc(e.device_id.slice(0, 8))}</td><td><code>${esc(e.props)}</code></td></tr>`).join("");
@@ -87,8 +87,8 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     <div class="scroll"><table><thead><tr><th>Level</th><th>Starts</th><th>Wins</th><th>Losses</th><th>Win rate</th><th>Attempts per win</th><th>Quits*</th></tr></thead>
     <tbody>${levelRows || `<tr><td colspan="7" class="empty">No level events yet.</td></tr>`}</tbody></table></div>
     <p class="note">Win rate is wins / (wins + losses). Attempts per win is starts / wins.
-    *Quits are inferred: a level_start with no level_complete or level_fail for the same device, session and level,
-    older than ${QUIT_AFTER_MS / 60_000} minutes, plus any level_quit the game sends.</p></section>
+    *Quits are inferred: a level_start with no level_complete or level_fail for the same device, level and attempt,
+    received more than ${QUIT_AFTER_MS / 60_000} minutes ago, plus any level_quit the game sends.</p></section>
   <section><h2>Where players quit</h2><p class="note">Inferred quits per level, highest first.</p>
     ${barList(quits.map((l) => ({ label: `Level ${l.level}`, value: l.quits })))}</section>
   <section><h2>Booster use</h2><p class="note">Counts booster_used, booster_bought and try_taken, by event and booster.</p>
@@ -96,7 +96,7 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     <h3>Per day</h3>
     ${lineChart(boost.byDay.map((d) => d.label), [{ name: "Boosters", cls: "s1", values: boost.byDay.map((d) => d.count) }])}</section>
   <section><h2>Latest events</h2>
-    <div class="scroll"><table class="tail"><thead><tr><th>Received (UTC)</th><th>Event</th><th>Level</th><th>Attempt</th><th>Duration</th><th>Device</th><th>Props</th></tr></thead>
+    <div class="scroll"><table class="tail"><thead><tr><th>Time (UTC)</th><th>Event</th><th>Level</th><th>Attempt</th><th>Duration</th><th>Device</th><th>Props</th></tr></thead>
     <tbody>${tailRows || `<tr><td colspan="7" class="empty">No events yet.</td></tr>`}</tbody></table></div></section>`;
   return page(`idolytics: ${current.name}`, body);
 }

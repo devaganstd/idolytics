@@ -2,7 +2,7 @@
 
 Open source game analytics you host yourself. See where players win, lose and quit every level.
 
-- Runs on your own Cloudflare account (Worker plus D1); the free plan is enough for a small game.
+- Runs on your own Cloudflare account (Worker plus D1). Each stored event costs 2 D1 row writes, plus 1 per batch. With the SDK's batches of 10 or more events, the free plan's 100,000 row writes a day hold about 45,000 events a day for the whole account. Each project is capped at 20,000 events a day by default (`DAILY_EVENT_CAP`), so lower the cap if several projects share one free account.
 - Unity package by Git URL. Android, iOS, WebGL, desktop. No Google account needed.
 - Level first: starts, wins, losses, win rate, attempts per win and quits per level.
 - Plain HTTP JSON API for any other engine.

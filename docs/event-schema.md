@@ -47,12 +47,12 @@ The whole body is at most 64 KB. Gzip is not accepted in 0.1.
 |---|---|---|---|
 | `event_id` | string | yes | Unique per event, at most 64 characters. A UUID v4 is expected. A retried event with the same id is stored once. |
 | `name` | string | yes | `^[a-z][a-z0-9_]{0,39}$`. Names starting with `idl_` are reserved. |
-| `ts` | integer | yes | Milliseconds since 1970 on the device clock. At most 30 days in the past and 1 day in the future. |
+| `ts` | integer | yes | Milliseconds since 1970 on the device clock. A value more than 30 days in the past or 1 day in the future is replaced with the time the server received the event. |
 | `session_id` | string | yes | At most 64 characters. |
 | `user_id` | string | no | The game's own account id. Never personal data. |
 | `level` | string or integer | no | Stable level key, at most 40 characters. Stored as a string. |
-| `attempt` | integer | no | Starts of this level by this device, counting from 1. Not negative. |
-| `duration_ms` | integer | no | Measured on the device. Not negative. |
+| `attempt` | integer | no | Starts of this level by this device, counting from 1. A negative or non-integer value is stored as empty; the event is kept. |
+| `duration_ms` | integer | no | Measured on the device. A negative or non-integer value is stored as empty; the event is kept. |
 | `value` | number | no | Score, amount or revenue. Finite. |
 | `currency` | string | no | ISO 4217 for money, a game key for virtual currency. At most 16 characters. |
 | `props` | object | no | At most 25 keys. Keys follow the name rule. Values are strings of at most 100 characters, finite numbers or booleans. No nested objects or arrays. |
@@ -67,7 +67,11 @@ An event that breaks a rule is rejected on its own; the rest of the batch is sto
 { "accepted": 99, "rejected": 1 }
 ```
 
-A whole batch is refused with `401` for a missing or unknown write key, `413` over 64 KB, and `400` for invalid JSON, a missing `device_id` or a bad `events` array.
+A whole batch is refused with `401` for a missing or unknown write key, `413` over 64 KB, `400` for invalid JSON, a missing `device_id` or a bad `events` array, and `429` with `Retry-After` once the project has reached its daily event cap.
+
+### Daily event cap
+
+Each project accepts up to 20,000 events per UTC day by default, set with the `DAILY_EVENT_CAP` variable. It protects the D1 free plan from a leaked write key or a bug that floods events. The cap is checked before each batch, so batches arriving at the same moment can pass it by one batch each. A replayed batch counts again. The free plan's D1 write budget is per account, not per project. The Unity SDK keeps refused events and retries with backoff. `Retry-After` gives the seconds until the next UTC midnight.
 
 ### Personal data is refused
 
@@ -98,7 +102,7 @@ How the dashboard reads them:
 
 - **Win rate** is wins / (wins + losses).
 - **Attempts per win** is starts / wins.
-- **Quits** are inferred. For each device, session and level, every `level_start` not closed by a `level_complete`, `level_fail` or `level_quit` counts as a quit once the last start is 30 minutes old. `level_quit` events the game sends are added. A game that never sends `level_quit` still gets a quit count.
+- **Quits** are inferred. For each device, level and attempt, every `level_start` not closed by a `level_complete`, `level_fail` or `level_quit` counts as a quit once the last start reached the server 30 minutes ago. Sessions are ignored, so a level resumed after a restart and then finished is not a quit. `level_quit` events the game sends are added. A game that never sends `level_quit` still gets a quit count.
 
 ### Boosters
 
