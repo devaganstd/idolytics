@@ -77,7 +77,7 @@ Each project accepts up to 20,000 events per UTC day by default, set with the `D
 
 Props named `email`, `name` or `phone`, and string values that look like an email address, reject the event. Never send names, emails, free text typed by the player, or device identifiers.
 
-## Standard events used by the 0.1 dashboard
+## Standard events used by the dashboard
 
 ### Session
 
@@ -102,7 +102,7 @@ How the dashboard reads them:
 
 - **Win rate** is wins / (wins + losses).
 - **Attempts per win** is starts / wins.
-- **Quits** are inferred. For each device, level and attempt, every `level_start` not closed by a `level_complete`, `level_fail` or `level_quit` counts as a quit once the last start reached the server 30 minutes ago. Sessions are ignored, so a level resumed after a restart and then finished is not a quit. `level_quit` events the game sends are added. A game that never sends `level_quit` still gets a quit count.
+- **Quits** are inferred. For each device, level and attempt, a `level_start` not closed by a `level_complete`, `level_fail` or `level_quit` counts as a quit once it reached the server 30 minutes ago, on the day of the start. Sessions are ignored, so a level resumed after a restart and finished within two days takes the quit back. `level_quit` events the game sends are added. A game that never sends `level_quit` still gets a quit count.
 
 ### Boosters
 
@@ -110,7 +110,7 @@ How the dashboard reads them:
 |---|---|
 | `booster_used` | `level`, `attempt`, `props.booster`, `props.source` (`stock`, `trial`, `gift`) |
 
-The dashboard also counts the Ninja Smash events `booster_bought` and `try_taken` as booster use, grouped by `props.booster`.
+The economy module planned for 0.2.2 also counts the Ninja Smash events `booster_bought` and `try_taken` as booster use, grouped by `props.booster`.
 
 ## Custom events
 

@@ -5,6 +5,8 @@
   "compatibility_date": "2026-11-01",
   // Events accepted per project per UTC day; ingest answers 429 above it.
   "vars": { "DAILY_EVENT_CAP": "20000" },
+  // Rolls raw events up into the dashboard tables and deletes raw rows older than 90 days.
+  "triggers": { "crons": ["*/15 * * * *"] },
   "d1_databases": [
     {
       "binding": "DB",

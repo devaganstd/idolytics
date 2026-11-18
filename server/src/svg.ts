@@ -4,29 +4,46 @@ import { esc } from "./html";
 const W = 420;
 const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 });
 
-/** Line chart over days, one or two series on one shared axis. Hover a point for its value. */
-export function lineChart(days: string[], series: { name: string; cls: string; values: number[] }[]): string {
-  if (!days.length) return `<p class="empty">No events yet.</p>`;
-  const H = 180, L = 30, R = 64, T = 12, B = 22;
-  const max = Math.max(1, ...series.flatMap((s) => s.values));
-  const x = (i: number) => L + (days.length === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (days.length - 1));
-  const y = (v: number) => T + (H - T - B) * (1 - v / max);
-  const grid = [0, 0.5, 1].map((f) => {
-    const v = Math.round(max * f);
-    return `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}"/><text class="axis" x="${L - 6}" y="${y(v) + 4}" text-anchor="end">${fmt(v)}</text>`;
+interface Series { name: string; cls: string; values: number[] }
+
+/** Round an axis maximum up to 1, 2 or 5 times a power of ten. */
+const niceMax = (v: number) => {
+  const p = 10 ** Math.floor(Math.log10(Math.max(1, v)));
+  return [1, 2, 5, 10].map((m) => m * p).find((m) => m >= v)!;
+};
+
+/**
+ * Stacked bars per day with an optional line on the same count axis. Each day links to href(day),
+ * so a click applies that day as the range. Hover shows the day's values.
+ */
+export function dayBars(days: string[], stacks: Series[], line: Series | null, href: (day: string) => string): string {
+  if (!days.length) return `<p class="empty">No days in range.</p>`;
+  const H = 190, L = 30, R = 6, T = 10, B = 22, plot = H - T - B;
+  const totals = days.map((_, i) => stacks.reduce((t, s) => t + s.values[i], 0));
+  const max = niceMax(Math.max(1, ...totals, ...(line?.values ?? [])));
+  const slot = (W - L - R) / days.length;
+  const bw = Math.max(1, Math.min(24, slot - 2));
+  const y = (v: number) => T + plot * (1 - v / max);
+  const grid = [0, 0.5, 1].map((f) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(max * f)}" y2="${y(max * f)}"/>`
+    + `<text class="axis" x="${L - 6}" y="${y(max * f) + 4}" text-anchor="end">${fmt(max * f)}</text>`).join("");
+  const tickAt = [...new Set([0, Math.floor((days.length - 1) / 2), days.length - 1])];
+  const ticks = tickAt.map((i, k) => `<text class="axis" x="${L + (i + 0.5) * slot}" y="${H - 6}"
+    text-anchor="${tickAt.length > 1 && k === 0 ? "start" : k === tickAt.length - 1 && k > 0 ? "end" : "middle"}">${esc(days[i].slice(5))}</text>`).join("");
+  const cols = days.map((d, i) => {
+    const x = L + i * slot;
+    let top = y(0);
+    const segs = stacks.map((s) => {
+      const h = (plot * s.values[i]) / max;
+      top -= h;
+      return h > 0 ? `<rect class="bar ${s.cls}" x="${x + (slot - bw) / 2}" y="${top}" width="${bw}" height="${h}"/>` : "";
+    }).join("");
+    const tip = [...stacks, ...(line ? [line] : [])].map((s) => `${s.name} ${fmt(s.values[i])}`).join(", ");
+    return `<a href="${esc(href(d))}"><title>${esc(d)}: ${esc(tip)}</title><rect class="hit" x="${x}" y="${T}" width="${slot}" height="${plot}"/>${segs}</a>`;
   }).join("");
-  const ticks = [0, days.length - 1].filter((v, i, a) => a.indexOf(v) === i)
-    .map((i) => `<text class="axis" x="${x(i)}" y="${H - 6}" text-anchor="${i === 0 ? "start" : "end"}">${esc(days[i].slice(5))}</text>`).join("");
-  const last = days.length - 1;
-  // End labels: push apart when the series end close together so they never overlap.
-  const labelY = series.map((s, i) => ({ i, y: y(s.values[last]) + 4 })).sort((a, b) => a.y - b.y);
-  labelY.forEach((l, k) => { if (k > 0) l.y = Math.max(l.y, labelY[k - 1].y + 14); });
-  const lines = series.map((s, si) => {
-    const pts = s.values.map((v, i) => `${x(i)},${y(v)}`).join(" ");
-    const dots = s.values.map((v, i) => `<circle class="${s.cls}" cx="${x(i)}" cy="${y(v)}" r="4"><title>${esc(days[i])}: ${fmt(v)} ${esc(s.name)}</title></circle>`).join("");
-    return `<polyline class="line ${s.cls}" points="${pts}"/>${dots}<text class="label" x="${x(last) + 8}" y="${labelY.find((l) => l.i === si)!.y}">${esc(s.name)}</text>`;
-  }).join("");
-  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(series.map((s) => s.name).join(" and "))} per day">${grid}${ticks}${lines}</svg>`;
+  const path = line ? `<polyline class="line ${line.cls}" points="${line.values.map((v, i) => `${L + (i + 0.5) * slot},${y(v)}`).join(" ")}"/>`
+    + (days.length <= 31 ? line.values.map((v, i) => `<circle class="${line.cls}" cx="${L + (i + 0.5) * slot}" cy="${y(v)}" r="3"/>`).join("") : "") : "";
+  const label = [...stacks, ...(line ? [line] : [])].map((s) => s.name).join(", ");
+  return `<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="${esc(label)} per day">${grid}${cols}${path}${ticks}</svg>`;
 }
 
 /** Horizontal bars, one series. Labels left, values right. */

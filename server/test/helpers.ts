@@ -40,13 +40,36 @@ export async function rows(sql = "SELECT * FROM events ORDER BY client_ts, event
 }
 
 export async function reset() {
-  await env.DB.batch(["events", "projects", "usage"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
+  await env.DB.batch(["events", "projects", "usage", "devices", "device_days", "cohort_days", "level_days", "event_days"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
 }
 
-let raw = 0;
+let stored = 0;
 /** Inserts a stored row directly, to control received_at. */
 export async function store(e: { name: string; device: string; session: string; level: string; attempt?: number | null; ts: number; received: number }) {
   await env.DB.prepare(INSERT_EVENT)
-    .bind("demo", `raw-${++raw}`, e.name, e.device, e.session, null, e.ts, e.received, null, null, null, null, e.level, e.attempt ?? null, null, null, null, null)
+    .bind("demo", `raw-${++stored}`, e.name, e.device, e.session, null, e.ts, e.received, null, null, null, null, e.level, e.attempt ?? null, null, null, null, null)
     .run();
+}
+
+let rawRow = 0;
+/** Inserts a full raw row for project demo. ts and received default to each other. */
+export async function raw(e: {
+  name: string; device: string; session: string; ts: number; received?: number; version?: string; platform?: string;
+  country?: string; level?: string; attempt?: number; duration?: number; value?: number; props?: Record<string, unknown>; id?: string;
+}) {
+  await env.DB.prepare(INSERT_EVENT)
+    .bind("demo", e.id ?? `r-${String(++rawRow).padStart(6, "0")}`, e.name, e.device, e.session, null, e.ts, e.received ?? e.ts,
+      e.version ?? "1.0", e.platform ?? "android", null, e.country ?? "ID", e.level ?? null, e.attempt ?? null,
+      e.duration ?? null, e.value ?? null, null, e.props ? JSON.stringify(e.props) : null)
+    .run();
+}
+
+/** Runs the rollup for project demo until it has read every raw row. */
+export async function rollUp(now: number, chunk?: number) {
+  const { rollupProject } = await import("../src/rollup");
+  for (let i = 0; i < 1000; i++) {
+    const p = await env.DB.prepare("SELECT * FROM projects WHERE id = 'demo'").first<import("../src/rollup").Project>();
+    if ((await rollupProject(env.DB, p!, now, chunk)) < (chunk ?? 1000)) return;
+  }
+  throw new Error("rollup did not finish");
 }

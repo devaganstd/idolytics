@@ -21,13 +21,15 @@ Data is sent over HTTPS when the endpoint is an `https://` URL, which is the cas
 
 ## Retention and deletion
 
-In 0.1, events are kept until you delete them. To delete one player's events, ask them for the install id (the game can show `Idolytics.InstallId` in a support screen) and run:
+Raw events are deleted 90 days after they reach the server. The daily tables built from them (`devices`, `device_days`) keep the install id, its first day, version, platform and country, and its daily session counts until you delete them. To delete one player's data, ask them for the install id (the game can show `Idolytics.InstallId` in a support screen) and run:
 
 ```bash
-npx wrangler d1 execute idolytics --remote --command "DELETE FROM events WHERE device_id = '<install id>'"
+npx wrangler d1 execute idolytics --remote --command "DELETE FROM events WHERE device_id = '<install id>'; DELETE FROM devices WHERE device_id = '<install id>'; DELETE FROM device_days WHERE device_id = '<install id>'"
 ```
 
-An admin endpoint for deletion and export, and a retention setting, are planned for a later release.
+The counts in `cohort_days`, `level_days` and `event_days` hold no install id, so they need no change.
+
+An admin endpoint for deletion and export is planned for a later release.
 
 ## Google Play Data safety answers
 

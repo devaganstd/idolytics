@@ -1,8 +1,8 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
-import { tzLabel, tzOffset } from "../src/dashboard";
-import { boosters, daily, DAY, levelStats, RANGE_DAYS } from "../src/queries";
-import { BASE, batch, createProject, ev, post, reset, store } from "./helpers";
+import { parseTz, tzLabel } from "../src/dashboard";
+import { at, NOW, seed } from "./fixture";
+import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
 const get = (path: string, headers: Record<string, string> = AUTH) =>
@@ -52,127 +52,112 @@ describe("projects", () => {
   });
 });
 
-describe("level stats", () => {
-  const now = Date.now();
-  const old = now - 60 * 60_000;
-  const at = (min: number) => now - min * 60_000;
+const RANGE = "range=custom&from=2026-11-01&to=2026-11-03";
+const kpi = (html: string, key: string) => html.match(new RegExp(`data-kpi="${key}"[^>]*><h3>[^<]*</h3><p class="value">([^<]*)<`))?.[1];
 
-  it("matches a hand count, inferring quits only for stale unclosed starts", async () => {
-    // d1: fails attempt 1, wins attempt 2. d2: wins level 1, leaves level 2 an hour ago.
-    // d3: started level 2 five minutes ago (still playing). d4: quits level 2 explicitly.
-    for (const e of [
-      { name: "level_start", device: "d1", level: "1", attempt: 1 }, { name: "level_fail", device: "d1", level: "1", attempt: 1 },
-      { name: "level_start", device: "d1", level: "1", attempt: 2 }, { name: "level_complete", device: "d1", level: "1", attempt: 2 },
-      { name: "level_start", device: "d2", level: "1", attempt: 1 }, { name: "level_complete", device: "d2", level: "1", attempt: 1 },
-      { name: "level_start", device: "d2", level: "2", attempt: 1 },
-      { name: "level_start", device: "d4", level: "2", attempt: 1 }, { name: "level_quit", device: "d4", level: "2", attempt: 1 },
-    ]) await store({ ...e, session: "s-" + e.device, ts: old, received: old });
-    await store({ name: "level_start", device: "d3", session: "s3", level: "2", attempt: 1, ts: at(5), received: at(5) });
-
-    expect(await levelStats(env.DB, "demo", now)).toEqual([
-      { level: "1", starts: 3, wins: 2, losses: 1, quits: 0, winRate: 2 / 3, attemptsPerWin: 1.5 },
-      { level: "2", starts: 3, wins: 0, losses: 0, quits: 2, winRate: null, attemptsPerWin: null },
-    ]);
-  });
-
-  it("ages a start by when the server received it, not by the device clock", async () => {
-    // Device clock 20 hours ahead; the start reached the server two hours ago and was never closed.
-    await store({ name: "level_start", device: "d1", session: "s1", level: "5", attempt: 1, ts: now + 20 * 3_600_000, received: at(120) });
-    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "5", starts: 1, quits: 1 });
-  });
-
-  it("keeps unclosed starts without an attempt apart by session", async () => {
-    await store({ name: "level_start", device: "d1", session: "a", level: "4", attempt: null, ts: at(90), received: at(90) });
-    await store({ name: "level_start", device: "d1", session: "b", level: "4", attempt: null, ts: at(5), received: at(5) });
-    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "4", starts: 2, quits: 1 });
-  });
-
-  it("does not count a level resumed and finished in a new session as a quit", async () => {
-    await store({ name: "level_start", device: "d1", session: "old", level: "3", attempt: 1, ts: at(90), received: at(90) });
-    await store({ name: "level_complete", device: "d1", session: "new", level: "3", attempt: 1, ts: at(10), received: at(10) });
-    expect((await levelStats(env.DB, "demo", now))[0]).toMatchObject({ level: "3", starts: 1, wins: 1, quits: 0 });
-  });
-});
-
-describe("booster use", () => {
-  it("totals by booster and by day", async () => {
+describe("dashboard pages", () => {
+  beforeEach(async () => {
     await createProject();
-    await post(batch([
-      ev({ name: "booster_bought", props: { booster: 2 } }), ev({ name: "booster_bought", props: { booster: 2 } }),
-      ev({ name: "try_taken", props: { booster: 1 } }), ev({ name: "level_start" }),
-    ]));
-    const b = await boosters(env.DB, "demo", Date.now());
-    expect(b.byBooster).toEqual([{ label: "booster_bought 2", count: 2 }, { label: "try_taken 1", count: 1 }]);
-    expect(b.byDay).toEqual([{ label: new Date().toISOString().slice(0, 10), count: 3 }]);
+    await seed();
+    await rollUp(NOW);
+    // Every page but Events must work from rollups alone.
+    await env.DB.prepare("DELETE FROM events").run();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at(20, 12)); // 2026-11-21
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("shows hand counted KPIs from rollups only", async () => {
+    const res = await get(`/?project=demo&${RANGE}`);
+    expect(res.status).toBe(200);
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeGreaterThan(0);
+    const html = await res.text();
+    expect(kpi(html, "dau")).toBe("1.7"); // 5 device days / 3 days
+    expect(kpi(html, "newUsers")).toBe("3");
+    expect(kpi(html, "sessions")).toBe("5");
+    expect(kpi(html, "sessionLength")).toBe("2m 48s"); // 14 minutes / 5 sessions
+    expect(kpi(html, "playtimePerUser")).toBe("4m 40s"); // 14 minutes / 3 players
+    expect(kpi(html, "d1")).toBe("33%"); // d1 back on day 1 of 3 installs
+    expect(kpi(html, "d7")).toBe("0%");
+    expect(kpi(html, "stickiness")).toBe("56%"); // 1.67 / 3
+    expect(html).toContain("No data for the previous 3 days");
+    expect(html).toContain('href="/?project=demo&amp;range=custom&amp;from=2026-11-02&amp;to=2026-11-02"');
+    expect(html).toMatch(/<td>2<\/td><td>2<\/td><td>2<\/td><td>100%<\/td>/); // level 2: 2 starts, 2 quits
+  });
+
+  it("applies the platform and players filters", async () => {
+    const ios = await (await get(`/?project=demo&${RANGE}&p=ios`)).text();
+    expect(kpi(ios, "dau")).toBe("0.7"); // 2 device days / 3 days
+    expect(kpi(ios, "newUsers")).toBe("1");
+    const returning = await (await get(`/?project=demo&${RANGE}&who=returning`)).text();
+    expect(kpi(returning, "newUsers")).toBe("0");
+    expect(kpi(returning, "sessions")).toBe("2");
+  });
+
+  it("compares with the previous period", async () => {
+    const html = await (await get("/?project=demo&range=custom&from=2026-11-02&to=2026-11-03")).text();
+    expect(kpi(html, "dau")).toBe("1.5");
+    // Previous period 10-31 to 11-01: 2 device days, so DAU 1; new users 2 against 1 now.
+    expect(html).toMatch(/data-kpi="dau".*?▲ 50% vs previous 2 days/s);
+    expect(html).toMatch(/data-kpi="newUsers".*?▼ 50% vs previous 2 days/s);
+  });
+
+  it("shows the retention cohorts with unfinished days marked", async () => {
+    const html = await (await get(`/retention?project=demo&${RANGE}`)).text();
+    expect(kpi(html, "d1")).toBe("33%");
+    const row = html.match(/<tr><th scope="row">11-01<\/th>.*?<\/tr>/s)![0];
+    expect(row).toContain("<td>2</td>");
+    expect([...row.matchAll(/>(\d+)%</g)].slice(0, 4).map((m) => m[1])).toEqual(["100", "50", "50", "0"]);
+    expect((row.match(/class="incomplete"/g) ?? []).length).toBe(11); // D20 to D30, as today is 11-21
+  });
+
+  it("shows the level table", async () => {
+    const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(html).toContain("<td>1</td><td>3</td><td>2</td><td>1</td><td>0</td>");
+    expect(html).toContain("<td>67%</td><td>1.5</td>");
+    expect(html).toContain("1m 33s"); // (120 + 100 + 60) s / 3
+  });
+
+  it("escapes player supplied text", async () => {
+    await raw({ name: "tap", device: "d9", session: "x", ts: at(19, 10), props: { note: "<script>alert(1)</script>" } });
+    const html = await (await get("/events?project=demo")).text();
+    expect(html).not.toContain("<script>alert(1)</script>");
+    expect(html).toContain("&lt;script&gt;");
   });
 });
 
-describe("time zone", () => {
-  const today = Math.floor(Date.now() / DAY) * DAY;
-  const evening = today - DAY + 18 * 3_600_000; // yesterday 18:00 UTC
-  const iso = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+describe("reporting time zone", () => {
+  const save = (body: string, origin = BASE) => exports.default.fetch(new Request(`${BASE}/settings/tz`, {
+    method: "POST", redirect: "manual",
+    headers: { ...AUTH, Origin: origin, "Content-Type": "application/x-www-form-urlencoded" }, body,
+  }));
 
-  it("buckets an 18:00 UTC event into the next day at UTC+7", async () => {
-    await store({ name: "session_start", device: "d1", session: "s1", level: "1", ts: evening, received: evening });
-    expect((await daily(env.DB, "demo", Date.now(), 0))[0].day).toBe(iso(evening));
-    expect((await daily(env.DB, "demo", Date.now(), 420))[0].day).toBe(iso(today));
-  });
-
-  it("starts the range at local midnight", async () => {
-    const now = today + 12 * 3_600_000;
-    const firstLocalDay = today - (RANGE_DAYS - 1) * DAY - 420 * 60_000; // 00:00 UTC+7, 29 days back
-    await store({ name: "session_start", device: "in", session: "a", level: "1", ts: firstLocalDay, received: now });
-    await store({ name: "session_start", device: "out", session: "b", level: "1", ts: firstLocalDay - 1, received: now });
-    expect(await daily(env.DB, "demo", now, 420)).toEqual([{ day: iso(today - (RANGE_DAYS - 1) * DAY), players: 1, sessions: 1 }]);
-  });
-
-  it("parses tz from the query or cookie and falls back to UTC", () => {
-    const tz = (q: string, cookie = "") => tzOffset(new Request(`${BASE}/${q}`, { headers: { Cookie: cookie } }));
-    expect(tz("?tz=420")).toBe(420);
-    expect(tz("?tz=-480")).toBe(-480);
-    expect(tz("", "a=1; tz=330")).toBe(330);
-    expect(tz("?tz=420", "tz=60")).toBe(420);
-    for (const bad of ["?tz=abc", "?tz=841", "?tz=-721", "?tz=7.5", "?tz=", "?tz=0x1a4"]) expect(tz(bad)).toBe(0);
-    expect(tz("", "tz=9999")).toBe(0);
+  it("parses and labels fixed offsets", () => {
+    expect(parseTz("420")).toBe(420);
+    expect(parseTz("-480")).toBe(-480);
+    for (const bad of ["abc", "841", "-721", "7.5", "", "0x1a4", null]) expect(parseTz(bad)).toBe(null);
     expect(tzLabel(0)).toBe("UTC");
     expect(tzLabel(420)).toBe("UTC+7");
     expect(tzLabel(330)).toBe("UTC+5:30");
     expect(tzLabel(-480)).toBe("UTC-8");
   });
 
-  it("stores the choice in a cookie and shows local times", async () => {
+  it("saves the project setting and shows the rebuild banner", async () => {
     await createProject();
-    await store({ name: "level_start", device: "d1", session: "s1", level: "1", ts: evening, received: evening });
-    const res = await get("/?project=demo&tz=420");
-    expect(res.headers.get("Set-Cookie")).toMatch(/^tz=420; Path=\/; Max-Age=31536000; SameSite=Lax/);
-    const html = await res.text();
-    expect(html).toContain("Times in UTC+7");
-    expect(html).toContain('<option value="420" selected>UTC+7 (WIB)</option>');
-    expect(html).toContain(new Date(evening + 7 * 3_600_000).toISOString().slice(5, 16).replace("T", " "));
-    expect(await (await get("/?project=demo", { ...AUTH, Cookie: "tz=420" })).text()).toContain("Times in UTC+7");
-  });
-
-  it("falls back to UTC for an invalid tz", async () => {
-    await createProject();
-    const res = await get("/?project=demo&tz=nope");
-    expect(res.headers.get("Set-Cookie")).toMatch(/^tz=0;/);
-    expect(await res.text()).toContain("Times in UTC.");
-  });
-});
-
-describe("dashboard page", () => {
-  it("renders every section and escapes player supplied text", async () => {
-    await createProject();
-    await post(batch([
-      ev({ name: "level_start", level: "1" }),
-      ev({ name: "booster_bought", props: { booster: 2, note: "<script>alert(1)</script>" } }),
-    ]));
+    const res = await save("project=demo&tz=420&back=%2Fretention%3Fproject%3Ddemo");
+    expect(res.status).toBe(303);
+    expect(res.headers.get("Location")).toBe("/retention?project=demo");
+    expect(await env.DB.prepare("SELECT tz_min, rollup_tz FROM projects").first()).toEqual({ tz_min: 420, rollup_tz: 0 });
     const html = await (await get("/?project=demo")).text();
-    for (const heading of ["Daily players and sessions", "Levels", "Where players quit", "Booster use", "Latest events"]) {
-      expect(html).toContain(heading);
-    }
-    expect(html).toContain("<svg");
-    expect(html).not.toContain("<script>alert(1)</script>");
-    expect(html).toContain("&lt;script&gt;");
+    expect(html).toContain('<option value="420" selected>UTC+7 (WIB)</option>');
+    expect(html).toContain("being rebuilt");
+    expect(html).toContain("midnight to midnight in UTC+7");
+  });
+
+  it("refuses an invalid zone, a cross origin post and an outside redirect", async () => {
+    await createProject();
+    expect((await save("project=demo&tz=nope")).status).toBe(400);
+    expect((await save("project=demo&tz=60", "https://evil.example")).status).toBe(403);
+    expect((await save("project=demo&tz=60&back=//evil.example")).headers.get("Location")).toBe("/");
   });
 });

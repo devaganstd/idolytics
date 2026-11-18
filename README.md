@@ -7,7 +7,7 @@ Open source game analytics you host yourself. See where players win, lose and qu
 - Level first: starts, wins, losses, win rate, attempts per win and quits per level.
 - Plain HTTP JSON API for any other engine.
 
-Status: 0.1, the first usable release. See [what is not in 0.1](#not-in-01-yet).
+Status: 0.2.0. The dashboard reads daily rollups and has a filter bar, an overview and retention cohorts. See [what is not in yet](#not-in-yet).
 
 ## Quickstart
 
@@ -67,9 +67,18 @@ Sessions and the install id are automatic. Press Play, finish a level, wait ten 
 
 ### 6. Open the dashboard
 
-Reload the server URL. You see daily players and sessions, the level table, the levels where players quit, booster use and the latest events.
+Reload the server URL about 15 minutes later. A cron job rolls new events up into daily tables every 15 minutes, and the dashboard reads only those tables, so a page load stays cheap. You see:
 
-Dates and times show in UTC until you pick a time zone in the page header, such as UTC+7 (WIB). The choice is a fixed offset with no daylight saving, and it is kept in a cookie in your browser. The daily event cap still resets at UTC midnight.
+- **Overview:** average DAU, new users, sessions, session length, playtime per user, D1 and D7 retention and stickiness, each against the previous period; daily new and returning players; top events; the levels with the most quits.
+- **Retention:** install day cohorts from D0 to D30.
+- **Levels:** starts, wins, fails, quits, win rate, attempts per win and average duration per level.
+- **Events:** top events and the 50 newest raw events.
+
+The filter bar sets the date range (a preset, or custom dates; select a day in the chart to see only that day), the comparison, version, platform, country and new or returning players. Filters live in the URL, so a filtered view can be bookmarked.
+
+Each project has a reporting time zone, set in the page header: UTC by default, or a fixed offset such as UTC+7 (WIB), with no daylight saving. Days in every chart run from midnight to midnight in that zone. Changing it rebuilds the last 90 days in the background. The daily event cap still resets at UTC midnight.
+
+Raw events are deleted 90 days after they arrive. The daily tables are kept.
 
 ## Local development
 
@@ -96,9 +105,9 @@ node scripts/seed.mjs http://localhost:8787 idl_w_yourkey
 
 idolytics sends nothing to its authors. The SDK uses a random install id and no advertising or device ids, and the server never stores IP addresses. You are the data controller for what your game sends. See [docs/privacy.md](docs/privacy.md) for the Google Play Data safety answers and a privacy policy paragraph.
 
-## Not in 0.1 yet
+## Not in yet
 
-Planned for 0.2 and later (see [docs/06-roadmap.md](docs/06-roadmap.md)): owner accounts instead of one admin key, retention, a live view, filters by date, version and platform, rate limiting, a Deploy to Cloudflare button, a consent switch, typed helpers such as `Idolytics.LevelStart`, rollups and raw data retention, device deletion and export, Docker, and the Firebase BigQuery and Remote Config connectors.
+Planned for 0.2 and later (see [docs/06-roadmap.md](docs/06-roadmap.md) and [docs/08-dashboard-v0.2.md](docs/08-dashboard-v0.2.md)): owner accounts instead of one admin key, a live view, a progression funnel and level detail, filters by device, event and property, a device page, economy and ads, rate limiting, a Deploy to Cloudflare button, a consent switch, typed helpers such as `Idolytics.LevelStart`, device deletion and export, Docker, and the Firebase BigQuery and Remote Config connectors.
 
 ## Repository
 
