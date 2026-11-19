@@ -271,15 +271,19 @@ const RAW_LEVELS = (where: string) => `SELECT lv AS level, SUM(s) AS starts, COU
   GROUP BY lv ORDER BY CAST(lv AS INTEGER), lv`;
 
 export interface Results { key: string; starts: number; wins: number; fails: number; quits: number; draws: number; abandons: number; dh: number[] }
-export interface DimRow { value: string; plays: number; players: number; wins: number; losses: number; draws: number; score_sum: number; score_n: number }
+export interface DimRow {
+  value: string; plays: number; players: number; wins: number; losses: number; draws: number; score_sum: number; score_n: number;
+  duration_sum: number; duration_n: number; time_sum: number; time_n: number; dh: number[]; th: number[];
+}
 const BY = (col: string) => `SELECT ${col} AS key, SUM(starts) AS starts, SUM(wins) AS wins, SUM(fails) AS fails, SUM(quits) AS quits,
   SUM(draws) AS draws, SUM(abandons) AS abandons, ${SUMS(DH)} FROM play_days
   WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4) AND ${PLAT("?5")} AND ${KINDS} AND ${col} <> ''
   GROUP BY ${col} ORDER BY starts DESC, ${col}`;
 const DIM = `SELECT value, SUM(plays) AS plays, SUM(players) AS players, SUM(wins) AS wins, SUM(losses) AS losses, SUM(draws) AS draws,
-  SUM(score_sum) AS score_sum, SUM(score_n) AS score_n FROM dim_days
+  SUM(score_sum) AS score_sum, SUM(score_n) AS score_n, SUM(duration_sum) AS duration_sum, SUM(duration_n) AS duration_n,
+  SUM(time_sum) AS time_sum, SUM(time_n) AS time_n, ${SUMS(DH)}, ${SUMS(TH)} FROM dim_days
   WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4) AND ${PLAT("?5")} AND ${KINDS} AND dim = ?7
-  GROUP BY value ORDER BY plays DESC, value LIMIT 200`;
+  GROUP BY value ORDER BY plays DESC, value LIMIT 201`; // 200 values and "other"
 
 /**
  * All plays of the profile's kinds by play key, with distinct players, and results by mode, difficulty and opponent.
@@ -310,11 +314,16 @@ export async function levelTable(db: D1Database, project: string, f: Filters, tz
   };
 }
 
-/** One dimension's values with pick rate: plays with the value / all plays of the kinds (dim ""). */
-export async function contentPage(db: D1Database, project: string, f: Filters, kinds: string | null, dim: string) {
+/** Lower edge of a band value such as "-50--1"; "(none)" and others sort last. */
+const bandStart = (v: string) => { const m = /^-?\d+(\.\d+)?(?=-)/.exec(v); return m ? Number(m[0]) : Infinity; };
+
+/** One dimension's values with pick rate: plays with the value / all plays of the kinds (dim ""). Bands sort by their start. */
+export async function contentPage(db: D1Database, project: string, f: Filters, kinds: string | null, dim: string, bands = false) {
   const b = [project, f.from, f.to, f.v, f.p, kinds];
   const res = await db.batch<Record<string, unknown>>([db.prepare(DIM).bind(...b, dim), db.prepare(DIM).bind(...b, "")]);
-  return { rowsRead: rowsRead(res), values: res[0].results as unknown as DimRow[], plays: (res[1].results[0]?.plays as number) ?? 0 };
+  const values = res[0].results.map((r) => ({ ...r, dh: hist(r, DH), th: hist(r, TH) })) as unknown as DimRow[];
+  if (bands) values.sort((x, y) => bandStart(x.value) - bandStart(y.value) || x.value.localeCompare(y.value));
+  return { rowsRead: rowsRead(res), values, plays: (res[1].results[0]?.plays as number) ?? 0 };
 }
 
 export interface TrackRow { track: string; bucket: string; devices: number; reached: number; reach_days: number }

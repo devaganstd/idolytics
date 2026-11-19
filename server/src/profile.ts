@@ -2,7 +2,8 @@
 
 /** A log10 track buckets by powers of ten; its milestones default to LOG_MILESTONES. */
 export interface Track { key: string; label?: string; milestones: number[]; scale?: "log10" }
-export interface Dim { key: string; label?: string; multi?: boolean }
+/** bucket: the width of numeric bands, such as 50 for trophies 0-49, 50-99; the value is read from play_start. */
+export interface Dim { key: string; label?: string; multi?: boolean; bucket?: number }
 export interface Profile {
   preset: string; play_label: string; play_kinds: string[]; tracks: Track[]; dimensions: Dim[]; flows: string[];
   /** A numeric play_end props key with the in-game play time in seconds, such as match_sec, without waiting screens. */
@@ -18,7 +19,8 @@ export const PRESETS: Record<string, Profile> = {
   match_battle: {
     preset: "match_battle", play_label: "Match", play_kinds: ["match"],
     tracks: [{ key: "trophies", label: "Trophies", milestones: [300, 800, 1500] }, { key: "arena", label: "Arena", milestones: [2, 3, 4] }],
-    dimensions: [{ key: "level", label: "Board" }, { key: "mode" }, { key: "difficulty" }, { key: "opponent" }, { key: "deck", multi: true, label: "Card" }],
+    dimensions: [{ key: "level", label: "Board" }, { key: "mode" }, { key: "difficulty" }, { key: "opponent" }, { key: "deck", multi: true, label: "Card" },
+      { key: "trophies", label: "Trophies at start", bucket: 30 }],
     flows: [], play_time_prop: "match_sec",
   },
   run_roguelike: {
@@ -103,7 +105,10 @@ export function parseProfile(v: unknown): Profile {
     }) : base.tracks,
     dimensions: has("dimensions") ? list(o.dimensions, 12, (d) => {
       const r = d as Record<string, unknown>;
-      return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}), ...(r?.multi === true ? { multi: true } : {}) };
+      if (r?.bucket !== undefined && (typeof r.bucket !== "number" || !Number.isFinite(r.bucket) || r.bucket < 1e-6)) throw new Error("bucket must be a number of at least 0.000001");
+      if (r?.bucket !== undefined && r.multi === true) throw new Error(`dimension ${String(r.key)} cannot have both multi and a band width`);
+      return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}),
+        ...(r?.bucket !== undefined ? { bucket: r.bucket as number } : r?.multi === true ? { multi: true } : {}) };
     }).filter((d, i, all) => { if (all.findIndex((x) => x.key === d.key) !== i) throw new Error(`dimension ${d.key} is declared twice`); return true; }) : base.dimensions,
     flows: has("flows") ? list(o.flows, 10, (x) => str(x, 40)) : base.flows,
     ...(timeProp ? { play_time_prop: timeProp } : {}),

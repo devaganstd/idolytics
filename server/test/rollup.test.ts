@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
-import { DAY } from "../src/rollup";
-import { at, MIN, NOW, seed, seedAsPlays, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
+import { band, DAY } from "../src/rollup";
+import { parseProfile } from "../src/profile";
+import { at, MIN, NOW, seed, seedAsPlays, seedBands, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
 import { createProject, raw, reset, rollUp, rows } from "./helpers";
 import { runCron } from "../src/rollup";
 
@@ -159,13 +160,13 @@ describe("rollup", () => {
     expect(await env.DB.prepare("SELECT profile_detected FROM projects").first()).toEqual({ profile_detected: "match_battle" });
     const deck = await rows(`SELECT value, SUM(plays) AS plays, SUM(wins) AS wins, SUM(losses) AS losses, SUM(draws) AS draws,
       ROUND(SUM(score_sum), 2) AS score, SUM(score_n) AS score_n FROM dim_days WHERE dim = 'deck' GROUP BY value ORDER BY value`);
-    const all = { plays: 6, wins: 2, losses: 2, draws: 1, score: 2.9, score_n: 5 };
+    const all = { plays: 5, wins: 2, losses: 2, draws: 1, score: 2.9, score_n: 5 }; // the abandon is not a completed play
     expect(deck).toEqual([
       { value: "burst", ...all }, { value: "canon", ...all }, { value: "frost", ...all }, { value: "meteor", ...all }, { value: "pierce", ...all },
       { value: "wall", plays: 3, wins: 1, losses: 1, draws: 1, score: 1.8, score_n: 3 },
     ]);
     expect(await rows("SELECT dim, value, SUM(plays) AS plays FROM dim_days WHERE dim IN ('', 'opponent') GROUP BY dim, value ORDER BY dim"))
-      .toEqual([{ dim: "", value: "", plays: 6 }, { dim: "opponent", value: "bot", plays: 6 }]);
+      .toEqual([{ dim: "", value: "", plays: 5 }, { dim: "opponent", value: "bot", plays: 5 }]);
     expect(await rows("SELECT day, track, bucket, devices, reached, reach_days FROM track_days ORDER BY track, day, bucket")).toEqual([
       { day: "2026-11-01", track: "arena", bucket: "2", devices: 1, reached: 1, reach_days: 0 },
       { day: "2026-11-02", track: "arena", bucket: "3", devices: 1, reached: 1, reach_days: 1 },
@@ -280,6 +281,34 @@ describe("rollup", () => {
     await seedDurations();
     await rollUp(NOW);
     expect(await rows("SELECT SUM(duration_n) AS dn, SUM(time_n) AS tn, SUM(th4) AS th4 FROM play_days")).toEqual([{ dn: 5, tn: 0, th4: 0 }]);
+  });
+
+  it("bands a numeric dimension by its width, from play_start, else play_end", async () => {
+    await seedBands();
+    await rollUp(NOW);
+    expect(await rows(`SELECT value, plays, wins, losses, draws, duration_sum, duration_n, time_sum, time_n FROM dim_days
+      WHERE dim = 'trophies' ORDER BY value`)).toEqual([
+      { value: "(none)", plays: 1, wins: 1, losses: 0, draws: 0, duration_sum: 10_000, duration_n: 1, time_sum: 8, time_n: 1 },
+      { value: "-30--1", plays: 1, wins: 0, losses: 1, draws: 0, duration_sum: 20_000, duration_n: 1, time_sum: 15, time_n: 1 },
+      { value: "0-29", plays: 1, wins: 1, losses: 0, draws: 0, duration_sum: 30_000, duration_n: 1, time_sum: 28, time_n: 1 },
+      { value: "120-149", plays: 1, wins: 0, losses: 0, draws: 1, duration_sum: 120_000, duration_n: 1, time_sum: 110, time_n: 1 },
+      { value: "180-209", plays: 1, wins: 1, losses: 0, draws: 0, duration_sum: 50_000, duration_n: 1, time_sum: 45, time_n: 1 },
+      { value: "30-59", plays: 1, wins: 1, losses: 0, draws: 0, duration_sum: 60_000, duration_n: 1, time_sum: 55, time_n: 1 },
+      { value: "60-89", plays: 1, wins: 0, losses: 1, draws: 0, duration_sum: 90_000, duration_n: 1, time_sum: 80, time_n: 1 },
+    ]);
+    expect(await rows("SELECT dh4, th3 FROM dim_days WHERE dim = 'trophies' AND value = '0-29'")).toEqual([{ dh4: 1, th3: 1 }]);
+  });
+
+  it("names bands without float noise and refuses bad band widths", () => {
+    const cases: [unknown, number, string][] = [
+      [49, 50, "0-49"], [50, 50, "50-99"], [29.5, 30, "0-29"], [-1, 50, "-50--1"], [-50, 50, "-50--1"], [-51, 50, "-100--51"], [-0, 30, "0-29"],
+      [0.3, 0.1, "0.3-0.4"], [0.7, 0.1, "0.7-0.8"], [" 12 ", 30, "0-29"], [1e12 + 1, 1, "1000000000001-1000000000001"],
+      ["0x1F", 30, "(none)"], ["abc", 30, "(none)"], [null, 30, "(none)"], [true, 30, "(none)"], [1e15, 1, "(none)"],
+    ];
+    for (const [x, w, label] of cases) expect([x, w, band(x, w)]).toEqual([x, w, label]);
+    const dim = (d: Record<string, unknown>) => () => parseProfile({ preset: "match_battle", dimensions: [{ key: "trophies", ...d }] });
+    for (const bad of [{ bucket: 0 }, { bucket: -5 }, { bucket: "50" }, { bucket: 1e-7 }, { bucket: 30, multi: true }]) expect(dim(bad)).toThrow();
+    expect(dim({ bucket: 30 })().dimensions).toEqual([{ key: "trophies", bucket: 30 }]);
   });
 
   it("counts players per play kind", async () => {

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { parseTz, tzLabel } from "../src/dashboard";
-import { at, NOW, seed, seedAsPlays, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
+import { at, NOW, seed, seedAsPlays, seedBands, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
 import { PRESETS } from "../src/profile";
 import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
@@ -399,7 +399,7 @@ describe("game profiles: plays, progress, content and flows", () => {
     expect(cells(diff, "normal")).toEqual(["normal", "2", "0", "2", "0", "0", "0", "0%", "1m 15s", "1m 27s"]);
     expect(cells(diff, "hard")).toEqual(["hard", "2", "0", "0", "0", "1", "1", "–", "1m 15s", "1m 27s"]);
     expect(cells(section(html, "By mode"), "normal")).toEqual(["normal", "7", "2", "2", "1", "1", "1", "50%", "1m 15s", "1m 27s"]);
-    expect(cells(section(html, "By opponent"), "bot")).toEqual(["bot", "6", "2", "2", "1", "50%"]);
+    expect(cells(section(html, "By opponent"), "bot")).toEqual(["bot", "5", "2", "2", "1", "50%"]);
     expect(html).not.toContain("Progression"); // the level funnel is for levels only
   });
 
@@ -410,11 +410,34 @@ describe("game profiles: plays, progress, content and flows", () => {
     expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeGreaterThan(0);
     const html = await res.text();
     expect(html).toMatch(/aria-current="page"[^>]*>Card</);
-    expect(cells(html, "burst")).toEqual(["burst", "6", "100%", "3", "2", "2", "1", "50%", "0.58"]); // player days: m1 11-01, m2 11-01 and 11-02
-    expect(cells(html, "wall")).toEqual(["wall", "3", "50%", "1", "1", "1", "1", "50%", "0.60"]);
+    expect(cells(html, "burst")).toEqual(["burst", "5", "100%", "3", "2", "2", "1", "50%", "1m 00s", "1m 15s", "1m 27s", "0.58"]); // player days: m1 11-01, m2 11-01 and 11-02
+    expect(cells(html, "wall")).toEqual(["wall", "3", "60%", "1", "1", "1", "1", "50%", "1m 00s", "1m 15s", "1m 27s", "0.60"]);
     expect(html.indexOf(">burst<")).toBeLessThan(html.indexOf(">wall<"));
     const diff = await (await get(`/content?project=demo&${RANGE}&dim=difficulty`)).text();
-    expect(cells(diff, "easy")).toEqual(["easy", "2", "33%", "2", "2", "0", "0", "100%", "0.85"]);
+    expect(cells(diff, "easy")).toEqual(["easy", "2", "40%", "2", "2", "0", "0", "100%", "1m 00s", "1m 15s", "1m 27s", "0.85"]);
+  });
+
+  it("shows results and play length by trophy band from play_start, sorted by band", async () => {
+    await seedBands();
+    await rollUp(NOW);
+    const res = await get(`/content?project=demo&${RANGE}&dim=trophies`);
+    const html = await res.text();
+    expect(html).toMatch(/aria-current="page"[^>]*>Trophies at start</);
+    expect(cells(html, "Trophies at start")).toEqual(["Trophies at start", "Plays", "Pick rate", "Player days", "Wins", "Losses", "Draws", "Win rate",
+      "Avg duration", "Median ≈", "p90 ≈", "In-game avg", "In-game median ≈", "In-game p90 ≈", "Avg score"]);
+    const bands = {
+      "-30--1": ["1", "14%", "1", "0", "1", "0", "0%", "20s", "25s", "29s", "15s", "15s", "19s", "–"],
+      "0-29": ["1", "14%", "1", "1", "0", "0", "100%", "30s", "38s", "44s", "28s", "25s", "29s", "0.50"],
+      "30-59": ["1", "14%", "1", "1", "0", "0", "100%", "1m 00s", "1m 15s", "1m 27s", "55s", "53s", "59s", "0.70"],
+      "60-89": ["1", "14%", "1", "0", "1", "0", "0%", "1m 30s", "1m 45s", "1m 57s", "1m 20s", "1m 15s", "1m 27s", "0.20"],
+      "120-149": ["1", "14%", "1", "0", "0", "1", "–", "2m 00s", "2m 30s", "2m 54s", "1m 50s", "1m 45s", "1m 57s", "0.40"],
+      "180-209": ["1", "14%", "1", "1", "0", "0", "100%", "50s", "53s", "59s", "45s", "53s", "59s", "–"],
+      "(none)": ["1", "14%", "1", "1", "0", "0", "100%", "10s", "15s", "19s", "8s", "8s", "10s", "–"],
+    };
+    for (const [band, row] of Object.entries(bands)) expect(cells(html, band)).toEqual([band, ...row]);
+    const order = Object.keys(bands).map((b) => html.indexOf(`<td>${b}</td>`));
+    expect(order).toEqual([...order].sort((a, b) => a - b));
+    expect(html).not.toContain("<td>90-119</td>");
   });
 
   it("shows players along each track, time to each milestone and where they stop", async () => {

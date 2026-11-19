@@ -101,7 +101,8 @@ function fromForm(form: FormData) {
   return {
     preset: g("preset"), play_label: g("play_label"), play_kinds: g("play_kinds").split(",").map((k) => k.trim()).filter(Boolean),
     tracks: rows("t_on").map((i) => ({ key: g(`t_key_${i}`), ...label(`t_label_${i}`), milestones: nums(g(`t_ms_${i}`)), scale: g(`t_scale_${i}`) || undefined })),
-    dimensions: rows("d_on").map((i) => ({ key: g(`d_key_${i}`), ...label(`d_label_${i}`), ...(form.get(`d_multi_${i}`) ? { multi: true } : {}) })),
+    dimensions: rows("d_on").map((i) => ({ key: g(`d_key_${i}`), ...label(`d_label_${i}`), ...(form.get(`d_multi_${i}`) ? { multi: true } : {}),
+      ...(g(`d_bucket_${i}`) ? { bucket: Number(g(`d_bucket_${i}`)) } : {}) })),
     flows: form.getAll("flow").map(String).slice(0, 50),
     play_time_prop: g("play_time_prop"),
   };
@@ -284,10 +285,10 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     const dim = dims.find((d) => d.key === url.searchParams.get("dim")) ?? dims[0];
     if (!dim) { rowsRead = 0; body = `<section><p class="empty">Declare dimensions in the game profile in Settings.</p></section>`; }
     else {
-      const r = await contentPage(env.DB, pid, f, kinds, dim.key);
+      const r = await contentPage(env.DB, pid, f, kinds, dim.key, !!dim.bucket);
       rowsRead = r.rowsRead;
       const nav = dims.map((d) => `<a href="${esc(link({ dim: d.key }))}"${d === dim ? ' aria-current="page"' : ""}>${esc(d.label ?? d.key)}</a>`).join("");
-      body = `<nav class="sub" aria-label="Dimensions">${nav}</nav>${contentBody(dim.label ?? dim.key, r.values, r.plays)}`;
+      body = `<nav class="sub" aria-label="Dimensions">${nav}</nav>${contentBody(dim.label ?? dim.key, r.values, r.plays, profile?.play_time_prop, dim.bucket)}`;
     }
   } else if (url.pathname === "/progress") {
     const r = await progressPage(env.DB, pid, f);
@@ -518,22 +519,29 @@ function resultsBody(r: { modes: Results[]; difficulties: Results[]; opponents: 
     <th>Draws</th><th>Abandons</th><th>Win rate</th><th>Median duration ≈</th><th>p90 duration ≈</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.key)}</td><td>${x.starts}</td><td>${x.wins}</td>
     <td>${x.fails}</td><td>${x.quits}</td><td>${x.draws}</td><td>${x.abandons}</td><td>${pct(ratio(x.wins, x.wins + x.fails))}</td>
     <td>${quant(x.dh, 0.5)}</td><td>${quant(x.dh, 0.9)}</td></tr>`).join("")}</tbody></table></div></section>` : "";
-  const opp = r.opponents.length ? `<section><h2>By opponent</h2><p class="note">Ended plays by props.opponent.</p>
+  const opp = r.opponents.length ? `<section><h2>By opponent</h2><p class="note">Completed plays by props.opponent.</p>
     <div class="scroll"><table><thead><tr><th>Opponent</th><th>Plays</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win rate</th></tr></thead>
     <tbody>${r.opponents.map((x) => `<tr><td>${esc(x.value)}</td><td>${x.plays}</td><td>${x.wins}</td><td>${x.losses}</td><td>${x.draws}</td>
     <td>${pct(ratio(x.wins, x.wins + x.losses))}</td></tr>`).join("")}</tbody></table></div></section>` : "";
   return table("mode", r.modes) + table("difficulty", r.difficulties) + opp;
 }
 
-function contentBody(label: string, values: DimRow[], plays: number) {
+function contentBody(label: string, values: DimRow[], plays: number, timeProp?: string, bucket?: number) {
+  const time = !!timeProp && values.some((v) => v.time_n > 0);
+  const length = (sum: number, n: number, h: number[], scale = 1) => `<td>${dur(ratio(sum * scale, n))}</td><td>${quant(h, 0.5)}</td><td>${quant(h, 0.9)}</td>`;
   const rows = values.map((v) => `<tr><td>${esc(v.value)}</td><td>${v.plays}</td><td>${pct(ratio(v.plays, plays))}</td><td>${v.players}</td>
     <td>${v.wins}</td><td>${v.losses}</td><td>${v.draws}</td><td>${pct(ratio(v.wins, v.wins + v.losses))}</td>
+    ${length(v.duration_sum, v.duration_n, v.dh)}${time ? length(v.time_sum, v.time_n, v.th, 1000) : ""}
     <td>${v.score_n ? (v.score_sum / v.score_n).toFixed(2) : "–"}</td></tr>`).join("");
+  const cols = 12 + (time ? 3 : 0);
   return `<section><h2>${esc(label)}</h2>
-    <p class="note">Ended plays by value. Pick rate is plays with the value / all ${plays} ended plays; a play with several values, such as a deck,
-    counts once for each. Win rate is wins / (wins + losses). Score is the value sent with play_end. Player days counts each device once a day.</p>
+    <p class="note">Completed plays (win, loss, draw, prestige) by value. Pick rate is plays with the value / all ${plays} completed plays; a play with several values, such as a deck,
+    counts once for each.${bucket ? ` Values are bands ${esc(String(bucket))} wide of the value at play_start (play_end when the start has none); (none) when it is not a number.` : ""}
+    Win rate is wins / (wins + losses). Duration is duration_ms; median and p90 are estimated (≈) from buckets.${time ? ` In-game time is props.${esc(timeProp!)}.` : ""}
+    Score is the value sent with play_end. Player days counts each device once a day.</p>
     <div class="scroll"><table><thead><tr><th>${esc(label)}</th><th>Plays</th><th>Pick rate</th><th>Player days</th><th>Wins</th><th>Losses</th><th>Draws</th>
-    <th>Win rate</th><th>Avg score</th></tr></thead><tbody>${rows || `<tr><td colspan="9" class="empty">No plays with this dimension in this range.</td></tr>`}</tbody></table></div></section>`;
+    <th>Win rate</th><th>Avg duration</th><th>Median ≈</th><th>p90 ≈</th>${time ? "<th>In-game avg</th><th>In-game median ≈</th><th>In-game p90 ≈</th>" : ""}
+    <th>Avg score</th></tr></thead><tbody>${rows || `<tr><td colspan="${cols}" class="empty">No plays with this dimension in this range.</td></tr>`}</tbody></table></div></section>`;
 }
 
 function progressBody(profile: Profile | null, rows: TrackRow[]) {
@@ -597,7 +605,8 @@ function profileBody(current: Proj, saved: Profile | null, shown: Profile, seen:
   const dimRows = dims.map(({ d, on }, i) => `<tr><td><input type="checkbox" name="d_on" value="${i}"${on ? " checked" : ""} aria-label="Count this dimension"></td>
     <td><input type="hidden" name="d_key_${i}" value="${esc(d.key)}"><code>${esc(d.key)}</code></td>
     <td><input name="d_label_${i}" value="${esc(d.label ?? "")}" maxlength="40" placeholder="${esc(d.key)}"></td>
-    <td><input type="checkbox" name="d_multi_${i}" value="1"${d.multi ? " checked" : ""} aria-label="Several comma-separated values"></td><td>${count(d.key)}</td></tr>`).join("");
+    <td><input type="checkbox" name="d_multi_${i}" value="1"${d.multi ? " checked" : ""} aria-label="Several comma-separated values"></td>
+    <td><input type="number" name="d_bucket_${i}" value="${d.bucket ?? ""}" min="0" step="any" aria-label="Band width" placeholder="none"></td><td>${count(d.key)}</td></tr>`).join("");
   const flows = [...shown.flows, ...seen.flows.filter((f) => !shown.flows.includes(f))];
   const presetLabel = (k: string) => `${k}${k === current.profile_detected ? " (Detected)" : ""}`;
   return `<section><h2>Game profile</h2>
@@ -614,8 +623,8 @@ function profileBody(current: Proj, saved: Profile | null, shown: Profile, seen:
       <label>In-game time prop <input name="play_time_prop" value="${esc(shown.play_time_prop ?? "")}" maxlength="40" placeholder="match_sec"></label>
       <p class="note">A numeric play_end props key with the play time in seconds without waiting screens; the Plays page then shows its average, median and p90.</p>
       <h3>Tracks</h3><div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Milestones</th><th>Scale</th></tr></thead><tbody>${trackRows}</tbody></table></div>
-      <h3>Dimensions</h3><p class="note">Props keys of play events; at most 12 checked. Multi splits a comma-separated value, such as a deck.</p>
-      <div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Multi</th><th>Seen</th></tr></thead><tbody>${dimRows}</tbody></table></div>
+      <h3>Dimensions</h3><p class="note">Props keys of play events; at most 12 checked. Multi splits a comma-separated value, such as a deck. A band width groups a number into bands, such as 50 for trophies 0-49, 50-99, read at play_start.</p>
+      <div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Multi</th><th>Band width</th><th>Seen</th></tr></thead><tbody>${dimRows}</tbody></table></div>
       <h3>Flows</h3>${flows.length ? `<p class="checks">${flows.map((f) => `<label class="check"><input type="checkbox" name="flow" value="${esc(f)}"${shown.flows.includes(f) ? " checked" : ""}> ${esc(f)}</label>`).join("")}</p>`
         : `<p class="note">No step flows seen in the last 7 days.</p>`}
       <button>Save profile</button></form>

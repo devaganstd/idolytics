@@ -201,3 +201,32 @@ export async function seedDurations() {
   await play("h2", at(0, 11), "win", 3, 1);
   await play("h2", at(0, 11, 1), "loss", 13, 10);
 }
+
+/**
+ * Hand counted trophy bands (width 30, the match_battle preset) on 11-01, board "arena", kind match. b1 android, b2 ios. Trophies come from play_start,
+ * or from play_end when play_start has none. Completed plays, as trophies / result / duration s / match_sec / score:
+ *   b1: 10 (end says 40) win 30/28/0.5; 45 win 60/55/0.7; 60 loss 90/80/0.2
+ *   b2: none at start, 120 at end, draw 120/110/0.4; -20 loss 20/15; "abc" win 10/8; 205 win 50/45
+ * Not completed: b2 130 abandon 300 s; b1 70 quit.
+ * Bands: -30--1, 0-29, 30-59, 60-89, 120-149, 180-209, (none); 7 completed plays.
+ */
+export async function seedBands() {
+  let attempt = 0;
+  const play = async (device: string, h: number, start: unknown, end: unknown, result: string, sec: number, matchSec?: number, score?: number) => {
+    const props = { kind: "match", mode: "ranked" };
+    const a = ++attempt;
+    const more = { session: device + "s", level: "arena", attempt: a, ...(device === "b2" ? { platform: "ios", country: "US" } : {}) };
+    await raw({ name: "play_start", device, ts: at(0, h), ...more, props: { ...props, ...(start === undefined ? {} : { trophies: start }) } });
+    await raw({ name: "play_end", device, ts: at(0, h) + sec * 1000, ...more, duration: sec * 1000, value: score,
+      props: { ...props, result, ...(end === undefined ? {} : { trophies: end }), ...(matchSec === undefined ? {} : { match_sec: matchSec }) } });
+  };
+  await play("b1", 8, 10, 40, "win", 30, 28, 0.5);
+  await play("b1", 9, 45, undefined, "win", 60, 55, 0.7);
+  await play("b1", 10, 60, undefined, "loss", 90, 80, 0.2);
+  await play("b1", 11, 70, undefined, "quit", 40, 35);
+  await play("b2", 8, undefined, 120, "draw", 120, 110, 0.4);
+  await play("b2", 9, 130, undefined, "abandon", 300, 290);
+  await play("b2", 10, -20, undefined, "loss", 20, 15);
+  await play("b2", 11, "abc", 300, "win", 10, 8);
+  await play("b2", 12, 205, undefined, "win", 50, 45);
+}

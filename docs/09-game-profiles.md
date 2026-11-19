@@ -80,7 +80,8 @@ A game profile is a small JSON document stored per project and edited in Setting
     { "key": "board" },
     { "key": "difficulty" },
     { "key": "mode" },
-    { "key": "deck", "multi": true, "label": "Card" }
+    { "key": "deck", "multi": true, "label": "Card" },
+    { "key": "trophies", "label": "Trophies at start", "bucket": 30 }
   ],
   "flows": ["tutorial1", "tutorial2"],
   "play_time_prop": "match_sec",
@@ -88,6 +89,8 @@ A game profile is a small JSON document stored per project and edited in Setting
   "moves_label": null
 }
 ```
+
+A dimension with `bucket` (v0.3.3) is a numeric band: the value is floor(x / bucket) * bucket shown as `0-49`, `50-99`, `-50--1` (a width that is not whole names the next band's start, such as `0-0.5`), read from `play_start` and from `play_end` only when the start does not send the key; a value that is not a number counts as `(none)`. The `match_battle` preset has `trophies` with bucket 30, so one normal win of +30 moves one band. The Content tab sorts bands by their start.
 
 `play_time_prop` (v0.3.2, optional) names a numeric `play_end` props key with the in-game play time in seconds, without waiting screens such as a versus screen. The Plays page then shows its average, median and p90 as "In-game time". The `match_battle` preset sets it to `match_sec`; `""` unsets it.
 
@@ -134,7 +137,7 @@ The 0.2 pages (Overview, Retention, Events, Economy and ads, Live, Device, Setti
 | Table | Key | Values |
 |---|---|---|
 | `play_days` (replaces `level_days`) | project, day, kind, play key, mode, difficulty, version, platform | the `level_days` values, plus draws and abandons |
-| `dim_days` | project, day, dimension, value, kind, version, platform | plays, players, wins, losses, draws, score sum |
+| `dim_days` | project, day, dimension, value, kind, version, platform | completed plays (from v0.3.3), players, wins, losses, draws, score sum, duration and in-game time sums with histograms |
 | `track_days` | project, day, track, bucket, version, platform | devices whose highest value that day falls in the bucket; buckets come from the milestones |
 | `step_days` | project, day, flow, step, version, platform | devices that reached the step, duration sum and count |
 

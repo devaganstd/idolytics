@@ -43,6 +43,16 @@ export const TH = DH.map((c) => "t" + c.slice(1));
 const durBucket = (sec: number) => { const i = DUR_EDGES.findIndex((e) => sec < e); return i < 0 ? DUR_EDGES.length : i; };
 /** Results of a completed play, whose length counts; quits and abandons do not. */
 const COMPLETED = new Set(["wins", "fails", "draws", "prestiges"]);
+/** The band of a numeric props value for a dimension of this width: "0-49", "50-99", "-50--1"; "(none)" when not a number. */
+export function band(x: unknown, width: number): string {
+  const v = typeof x === "number" ? x : typeof x === "string" && /^\s*-?\d+(\.\d+)?\s*$/.test(x) ? Number(x) : NaN;
+  // shortcut: values of 1e15 and over count as (none), so labels never need exponents; widen if a game sends such scores.
+  if (!Number.isFinite(v) || Math.abs(v) >= 1e15) return NO_LEVEL;
+  // toPrecision drops float noise, so 0.3 / 0.1 is band 3, not 2.
+  const lo = Math.floor(Number((v / width).toPrecision(15))) * width, n = (y: number) => String(Number(y.toPrecision(15)));
+  // Whole widths end on the last whole number of the band; other widths name the next band's start.
+  return Number.isInteger(width) ? `${n(lo)}-${n(lo + width - 1)}` : `${n(lo)}-${n(lo + width)}`;
+}
 /** Play events; one without a level counts under this play key. */
 const PLAY_EVENTS = new Set(["level_start", "level_complete", "level_fail", "level_quit", "play_start", "play_end"]);
 export const NO_LEVEL = "(none)";
@@ -75,7 +85,8 @@ interface Raw {
   attempt: number | null; duration_ms: number | null; value: number | null; currency: string | null; props: string | null;
 }
 /** An unclosed play start: received at, day, version, platform, level, kind, mode, difficulty, counted as a quit. */
-interface Open { r: number; d: string; v: string; p: string; l: string; k?: string; m?: string; f?: string; q?: 1 }
+/** b: band dimension values read from the play_start, by dimension key. */
+interface Open { r: number; d: string; v: string; p: string; l: string; k?: string; m?: string; f?: string; q?: 1; b?: Record<string, string> }
 interface Dev {
   first_day: string; version: string; platform: string; country: string; open: Record<string, Open>; tracks: Record<string, string>;
   dirty: boolean; isNew: boolean;
@@ -320,7 +331,10 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       // Players per kind: seen.l holds "kind\u001flevel". A bare level is from before 0.3.1, of any kind.
       const pk = `${kind}\u001f${level}`;
       if (!dd.seen.l.includes(pk) && !dd.seen.l.includes(level)) { dd.seen.l.push(pk); add(levels, lk, "players", 1); }
-      dev.open[ok] = { r: r.received_at, d: day, v, p: pl, l: level, k: kind, m: mode, f: difficulty };
+      // A band dimension takes its value at the start of the play, such as trophies before the match.
+      const b = Object.fromEntries((profile?.dimensions ?? []).filter((d) => d.bucket && props[d.key] !== undefined && props[d.key] !== null)
+        .map((d) => [d.key, band(props[d.key], d.bucket!)]));
+      dev.open[ok] = { r: r.received_at, d: day, v, p: pl, l: level, k: kind, m: mode, f: difficulty, ...(Object.keys(b).length ? { b } : {}) };
       dev.dirty = true;
       continue;
     }
@@ -343,11 +357,13 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       delete dev.open[ok];
       dev.dirty = true;
     }
-    // Dimensions: each ended play once per value, and once under dim "" for the kind's total.
-    if (!profile) continue;
+    // Dimensions: each completed play once per value, and once under dim "" for the kind's total.
+    if (!profile || !field || !COMPLETED.has(field)) continue;
     const dimRow = (dim: string, value: string) => {
       const k = [day, dim, value, kind, v, pl];
       add(dims, k, "plays", 1);
+      if (r.duration_ms !== null) { add(dims, k, "duration_sum", r.duration_ms); add(dims, k, "duration_n", 1); add(dims, k, DH[durBucket(r.duration_ms / 1000)], 1); }
+      if (typeof t === "number" && Number.isFinite(t) && t >= 0) { add(dims, k, "time_sum", t); add(dims, k, "time_n", 1); add(dims, k, TH[durBucket(t)], 1); }
       if (result === "win" || result === "draw") add(dims, k, result === "win" ? "wins" : "draws", 1);
       if (result === "loss") add(dims, k, "losses", 1);
       if (r.value !== null) { add(dims, k, "score_sum", r.value); add(dims, k, "score_n", 1); }
@@ -356,6 +372,8 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     };
     dimRow("", "");
     for (const d of profile.dimensions) {
+      // One source per play: the start's value when the start sent the key, else the end's.
+      if (d.bucket) { dimRow(d.key, capped(d.key, o?.b && Object.hasOwn(o.b, d.key) ? o.b[d.key] : band(props[d.key], d.bucket))); continue; }
       const raw = d.key === "level" && props.level === undefined ? level : props[d.key];
       const values = d.multi && typeof raw === "string" ? [...new Set(raw.split(",").map((s) => text(s.trim())).filter(Boolean))].slice(0, 10)
         : text(raw) ? [text(raw)] : [];
@@ -385,7 +403,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     [...m].map(([k, o]) => [...JSON.parse(k), ...fields.map((f) => o[f] ?? 0)]);
   const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "draws", "abandons", "prestiges", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts",
     "time_sum", "time_n", ...DH, ...TH];
-  const DIM_FIELDS = ["plays", "players", "wins", "losses", "draws", "score_sum", "score_n"];
+  const DIM_FIELDS = ["plays", "players", "wins", "losses", "draws", "score_sum", "score_n", "duration_sum", "duration_n", "time_sum", "time_n", ...DH, ...TH];
   const TRACK_FIELDS = ["devices", "reached", "reach_days"];
   const STEP_FIELDS = ["devices", "duration_sum", "duration_n", "skips"];
   const ECON_FIELDS = ["count", "value_sum", "duration_sum"];

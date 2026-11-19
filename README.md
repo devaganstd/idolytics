@@ -7,7 +7,7 @@ Open source game analytics you host yourself. See where players win, lose and qu
 - Level first: starts, wins, losses, win rate, attempts per win and quits per level.
 - Plain HTTP JSON API for any other engine.
 
-Status: 0.3.2. The dashboard reads daily rollups and has a filter bar, an overview with session rhythm, retention cohorts, plays (levels, matches or runs) with level detail, progress, content and flows from a game profile, economy and ads, events, a device page, a live view and settings, plus test and live write keys. See [what is not in yet](#not-in-yet).
+Status: 0.3.3. The dashboard reads daily rollups and has a filter bar, an overview with session rhythm, retention cohorts, plays (levels, matches or runs) with level detail, progress, content and flows from a game profile, economy and ads, events, a device page, a live view and settings, plus test and live write keys. See [what is not in yet](#not-in-yet).
 
 ## Quickstart
 
@@ -73,7 +73,7 @@ Reload the server URL about 15 minutes later. A cron job rolls new events up int
 - **Retention:** install day cohorts from D0 to D30.
 - **Levels** (or Matches, Runs, from the game profile): a sortable table of starts, distinct players, wins, fails, quits (inferred), draws and abandons when there are any, win rate, first try win rate, attempts per win, average, median and p90 duration of completed plays (and of the in-game time prop when the profile names one), and average stars and moves left when the game sends them; results by mode, difficulty and opponent; an Exclude editor toggle (also in the platform filter as All but editor); a progression funnel for levels. Select one for its numbers by day and by version, and its fail and quit reasons, boosters and continues.
 - **Progress:** players along each track of the profile (such as trophies), the days from install to each milestone, and where players stop.
-- **Content:** one tab per profile dimension (such as board, difficulty or card): plays, pick rate, win rate and average score per value.
+- **Content:** one tab per profile dimension (such as board, difficulty or card): completed plays, pick rate, win rate, average, median and p90 duration (and in-game time), and average score per value; a numeric dimension with a band width, such as trophies in bands of 30, shows one row per band.
 - **Flows:** a step funnel per flow, with drop off, time in step and skips; the tutorial events count as the flow `tutorial`.
 - **Events:** any event over time, a breakdown by one props key (top 20 values), and the 100 newest raw events, filterable by name and device.
 - **Device:** one device's install, its active days and its raw events newest first. A device id in the Events tail links to it.
