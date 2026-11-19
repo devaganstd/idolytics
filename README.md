@@ -7,7 +7,7 @@ Open source game analytics you host yourself. See where players win, lose and qu
 - Level first: starts, wins, losses, win rate, attempts per win and quits per level.
 - Plain HTTP JSON API for any other engine.
 
-Status: 0.3.0. The dashboard reads daily rollups and has a filter bar, an overview, retention cohorts, plays (levels, matches or runs) with level detail, progress, content and flows from a game profile, economy and ads, events, a device page, a live view and settings, plus test and live write keys. See [what is not in yet](#not-in-yet).
+Status: 0.3.1. The dashboard reads daily rollups and has a filter bar, an overview with session rhythm, retention cohorts, plays (levels, matches or runs) with level detail, progress, content and flows from a game profile, economy and ads, events, a device page, a live view and settings, plus test and live write keys. See [what is not in yet](#not-in-yet).
 
 ## Quickstart
 
@@ -74,7 +74,7 @@ Reload the server URL about 15 minutes later. A cron job rolls new events up int
 - **Levels** (or Matches, Runs, from the game profile): a sortable table of starts, distinct players, wins, fails, quits (inferred), draws and abandons when there are any, win rate, first try win rate, attempts per win, average duration, and average stars and moves left when the game sends them; results by mode, difficulty and opponent; a progression funnel for levels. Select one for its numbers by day and by version, and its fail and quit reasons, boosters and continues.
 - **Progress:** players along each track of the profile (such as trophies), the days from install to each milestone, and where players stop.
 - **Content:** one tab per profile dimension (such as board, difficulty or card): plays, pick rate, win rate and average score per value.
-- **Flows:** a step funnel per flow, with drop off and time in step; the tutorial events count as the flow `tutorial`.
+- **Flows:** a step funnel per flow, with drop off, time in step and skips; the tutorial events count as the flow `tutorial`.
 - **Events:** any event over time, a breakdown by one props key (top 20 values), and the 100 newest raw events, filterable by name and device.
 - **Device:** one device's install, its active days and its raw events newest first. A device id in the Events tail links to it.
 - **Economy:** currency earned and spent per currency by day with the top sources and sinks, boosters used and offered, ads shown per format per day, and revenue and ARPDAU when events send `value`.
@@ -83,7 +83,7 @@ Reload the server URL about 15 minutes later. A cron job rolls new events up int
 
 The Levels, Progress, Content, Flows and Economy tabs show only when the project has their events.
 
-Each project has a game profile, set in Settings: a preset (`puzzle_levels`, `match_battle`, `run_roguelike`, `idle_tycoon`) or your own JSON naming the plays, tracks with milestones, and the props keys to break plays down by. Until you save one, the preset detected from the first events is used. See [docs/09-game-profiles.md](docs/09-game-profiles.md).
+Each project has a game profile, set in Settings with a form: a preset (`puzzle_levels`, `match_battle`, `run_roguelike`, `idle_tycoon`) to start from, the play label, tracks with milestones (linear or log10), the props keys to break plays down by, and the flows. The form suggests the tracks, keys and flows seen in the last 7 days; the raw JSON is under Advanced. Until you save one, the preset is detected again each day from the last 7 days. Large numbers show with suffixes (K, M, B, T, Qa and on), and the Economy charts have a log scale. See [docs/09-game-profiles.md](docs/09-game-profiles.md) and [docs/10-v0.3.1.md](docs/10-v0.3.1.md).
 
 Each project has a live write key (from step 2) and can have a test key, created and rotated in Settings and shown once. Events sent with the test key go to a hidden test copy of the project; switch between Live and Test at the top of the page. Use the test key in editor and development builds so test plays never mix with real players.
 

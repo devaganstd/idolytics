@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { DAY } from "../src/rollup";
-import { at, MIN, NOW, seed, seedAsPlays, seedEconomy, seedMatch } from "./fixture";
+import { at, MIN, NOW, seed, seedAsPlays, seedEconomy, seedIdle, seedMatch } from "./fixture";
 import { createProject, raw, reset, rollUp, rows } from "./helpers";
 import { runCron } from "../src/rollup";
 
@@ -38,7 +38,7 @@ describe("rollup", () => {
       { first_day: "2026-11-01", day: "2026-11-03", version: "1.0", platform: "ios", country: "US", devices: 1 },
       { first_day: "2026-11-02", day: "2026-11-02", version: "1.1", platform: "android", country: "ID", devices: 1 },
     ]);
-    const zero = { kind: "level", mode: "", difficulty: "", draws: 0, abandons: 0, starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
+    const zero = { kind: "level", mode: "", difficulty: "", draws: 0, abandons: 0, prestiges: 0, starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
     expect(s.levels).toEqual([
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "android",
         starts: 2, players: 1, first_starts: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
@@ -219,6 +219,88 @@ describe("rollup", () => {
     await rollUp(NOW);
     expect(await rows("SELECT COUNT(DISTINCT value) AS n, SUM(value = 'other') AS other FROM dim_days WHERE dim = 'deck'")).toEqual([{ n: 201, other: 1 }]);
     expect(await rows("SELECT SUM(plays) AS n FROM dim_days WHERE dim = 'deck' AND value = 'other'")).toEqual([{ n: 3 }]);
+  });
+
+  it("rolls up idle runs, log10 income, session gaps, offline rewards and a tutorial skip to a hand count", async () => {
+    await seedIdle();
+    await rollUp(NOW);
+    expect(await env.DB.prepare("SELECT profile_detected FROM projects").first()).toEqual({ profile_detected: "idle_tycoon" });
+    expect(await rows(`SELECT day, platform, starts, players, wins, quits, prestiges, duration_sum, duration_n FROM play_days
+      WHERE kind = 'run' AND level = '(none)' ORDER BY day, platform`)).toEqual([
+      { day: "2026-11-01", platform: "android", starts: 2, players: 1, wins: 0, quits: 0, prestiges: 1, duration_sum: 36_000_000, duration_n: 1 },
+      { day: "2026-11-01", platform: "ios", starts: 1, players: 1, wins: 0, quits: 0, prestiges: 0, duration_sum: 0, duration_n: 0 },
+      { day: "2026-11-02", platform: "android", starts: 1, players: 1, wins: 0, quits: 1, prestiges: 1, duration_sum: 54_000_000, duration_n: 1 },
+      { day: "2026-11-02", platform: "ios", starts: 0, players: 0, wins: 0, quits: 0, prestiges: 1, duration_sum: 115_200_000, duration_n: 1 },
+    ]);
+    expect(await rows("SELECT COUNT(*) AS n FROM play_days WHERE level <> '(none)'")).toEqual([{ n: 0 }]);
+    expect(await rows("SELECT value, SUM(plays) AS plays FROM dim_days WHERE dim IN ('', 'boost') GROUP BY dim, value ORDER BY dim"))
+      .toEqual([{ value: "", plays: 3 }, { value: "x2", plays: 2 }]);
+    expect(await rows("SELECT day, bucket, SUM(devices) AS devices, SUM(reached) AS reached, SUM(reach_days) AS reach_days FROM track_days GROUP BY day, bucket ORDER BY day, bucket"))
+      .toEqual([
+        { day: "2026-11-01", bucket: "1000", devices: 1, reached: 1, reach_days: 0 },
+        { day: "2026-11-01", bucket: "<1000", devices: 1, reached: 0, reach_days: 0 },
+        { day: "2026-11-02", bucket: "1000", devices: 0, reached: 1, reach_days: 1 },
+        { day: "2026-11-02", bucket: "1000000", devices: 1, reached: 2, reach_days: 2 },
+        { day: "2026-11-02", bucket: "1000000000", devices: 1, reached: 1, reach_days: 1 },
+      ]);
+    expect(await rows("SELECT day, bucket, platform, sessions FROM gap_days ORDER BY day, platform, bucket")).toEqual([
+      { day: "2026-11-01", bucket: "4-12h", platform: "android", sessions: 1 },
+      { day: "2026-11-01", bucket: "<1h", platform: "android", sessions: 1 },
+      { day: "2026-11-02", bucket: "12-24h", platform: "android", sessions: 1 },
+      { day: "2026-11-02", bucket: "1-4h", platform: "ios", sessions: 1 },
+      { day: "2026-11-02", bucket: "24h+", platform: "ios", sessions: 1 },
+    ]);
+    expect(await rows("SELECT day, detail, platform, count, value_sum, duration_sum FROM econ_days WHERE name = 'offline_reward' ORDER BY day, platform")).toEqual([
+      { day: "2026-11-01", detail: "free", platform: "android", count: 1, value_sum: 1000, duration_sum: 1_800_000 },
+      { day: "2026-11-02", detail: "ad", platform: "android", count: 1, value_sum: 2e12, duration_sum: 50_400_000 },
+      { day: "2026-11-02", detail: "ad", platform: "ios", count: 1, value_sum: 3e15, duration_sum: 108_000_000 },
+    ]);
+    expect(await rows("SELECT step, devices, skips FROM step_days WHERE flow = 'tutorial' ORDER BY step")).toEqual([
+      { step: 0, devices: 1, skips: 0 }, { step: 1, devices: 1, skips: 0 }, { step: 2, devices: 1, skips: 1 },
+    ]);
+  });
+
+  it("counts players per play kind", async () => {
+    await raw({ name: "play_start", device: "x", session: "s", ts: at(0, 10), level: "1", attempt: 1, props: { kind: "level" } });
+    await raw({ name: "play_start", device: "x", session: "s", ts: at(0, 10, 1), level: "1", attempt: 2, props: { kind: "match" } });
+    await rollUp(NOW);
+    expect(await rows("SELECT kind, starts, players FROM play_days ORDER BY kind")).toEqual([
+      { kind: "level", starts: 1, players: 1 }, { kind: "match", starts: 1, players: 1 },
+    ]);
+  });
+
+  it("treats props keys such as constructor as plain dimension, track and flow names", async () => {
+    await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify({ preset: "match_battle", dimensions: [{ key: "constructor" }],
+      tracks: [{ key: "constructor", milestones: [1] }] })).run();
+    await raw({ name: "play_end", device: "x", session: "s", ts: at(0, 10), level: "1", attempt: 1, props: { kind: "match", result: "win", constructor: "a", toString: "b" } });
+    await raw({ name: "progress", device: "x", session: "s", ts: at(0, 10, 1), value: 2, props: { track: "constructor" } });
+    await raw({ name: "step", device: "x", session: "s", ts: at(0, 10, 2), props: { flow: "__proto__", step: 1 } });
+    await rollUp(NOW);
+    expect(await rows("SELECT dim, value FROM dim_days WHERE dim = 'constructor'")).toEqual([{ dim: "constructor", value: "a" }]);
+    expect(await rows("SELECT bucket, reached FROM track_days WHERE track = 'constructor'")).toEqual([{ bucket: "1", reached: 1 }]);
+    const seen = JSON.parse((await env.DB.prepare("SELECT seen_keys FROM projects").first<{ seen_keys: string }>())!.seen_keys);
+    expect(Object.keys(seen.k).sort()).toEqual(["constructor", "toString"]);
+    expect(Object.keys(seen.f)).toEqual(["__proto__"]);
+  });
+
+  it("detects the preset again each day from the last 7 days until a profile is saved", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const project = () => env.DB.prepare("SELECT profile_detected, detected_on, tz_min, rollup_tz FROM projects").first<Record<string, unknown>>();
+    expect(await project()).toMatchObject({ profile_detected: "match_battle", detected_on: "2026-11-03", rollup_tz: 0 });
+    // A week later the game sends idle runs only: the new preset is detected and the rollups rebuild with it.
+    for (let i = 0; i < 3; i++) {
+      await raw({ name: "play_start", device: "m1", session: "z", ts: at(9, 10, i), attempt: 100 + i, props: { kind: "run" } });
+      await raw({ name: "play_end", device: "m1", session: "z", ts: at(9, 10, i) + 30_000, attempt: 100 + i, props: { kind: "run", result: "prestige" } });
+    }
+    await rollUp(at(9, 23));
+    expect(await project()).toMatchObject({ profile_detected: "idle_tycoon", detected_on: "2026-11-10" });
+    expect((await project())!.rollup_tz).not.toBe(0);
+    // A saved profile stops detection.
+    await env.DB.prepare("UPDATE projects SET profile = ?, rollup_tz = 0, rebuild_from = NULL, rebuild_until = NULL").bind(JSON.stringify({ preset: "match_battle" })).run();
+    await raw({ name: "play_start", device: "m1", session: "z", ts: at(10, 10), attempt: 200, props: { kind: "run" } });
+    await rollUp(at(10, 23));
+    expect(await project()).toMatchObject({ profile_detected: "idle_tycoon", detected_on: "2026-11-10", rollup_tz: 0 });
   });
 
   it("rolls up economy and ad events by currency and detail", async () => {

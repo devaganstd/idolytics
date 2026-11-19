@@ -83,7 +83,7 @@ Props named `email`, `name` or `phone`, and string values that look like an emai
 
 | Event | Fields | Notes |
 |---|---|---|
-| `session_start` | | Sent by the Unity SDK at launch and after 30 seconds in the background. |
+| `session_start` | `props.since_last_ms` (SDK 0.2.1) | Sent by the Unity SDK at launch and after 30 seconds in the background. `since_last_ms` is the time since the previous session ended on this device; the first session has none. The Overview buckets it: under 1 h, 1 to 4 h, 4 to 12 h, 12 to 24 h, over 24 h. |
 
 Daily players count distinct `device_id`; sessions count distinct `session_id`.
 
@@ -131,11 +131,21 @@ A play is one level, match, run or round. `level_*` events are read as plays of 
 | Event | Fields |
 |---|---|
 | `play_start` | `level` (the play key: a level, a board or a stage), `attempt`, `props.kind` (`level`, `match`, `run`, `round`), `props.mode`, `props.difficulty`, `props.opponent` |
-| `play_end` | the same keys, plus `props.result` (`win`, `loss`, `draw`, `quit`, `abandon`), `props.reason`, `duration_ms`, `value` (the score) |
+| `play_end` | the same keys, plus `props.result` (`win`, `loss`, `draw`, `quit`, `abandon`, `prestige`), `props.reason`, `duration_ms`, `value` (the score, or the prestige currency gained) |
 | `progress` | `props.track` (such as `trophies`), `value` (the new value), `props.delta` |
 | `step` | `props.flow`, `props.step` (an integer from 0), `props.step_id`, `duration_ms` |
 
-The game profile declares which props keys are dimensions; a dimension marked `multi`, such as a deck, holds up to 10 comma-separated values, and each counts the play once. Each dimension keeps at most 200 values; later ones count as `other`. Tracks are counted by their milestones only. `tutorial_begin`, `tutorial_step` (`props.step`) and `tutorial_complete` are the flow `tutorial`.
+The game profile declares which props keys are dimensions; a dimension marked `multi`, such as a deck, holds up to 10 comma-separated values, and each counts the play once. Each dimension keeps at most 200 values; later ones count as `other`. Tracks are counted by their milestones only; a track with `"scale": "log10"` defaults to the milestones 1e3, 1e6, 1e9 and on. `tutorial_begin`, `tutorial_step` (`props.step`) and `tutorial_complete` are the flow `tutorial`, and `tutorial_skip` (`props.step`) a skip at that step. A play event without `level` counts under the play key `(none)`.
+
+### Idle games (v0.3.1)
+
+A run is one prestige cycle: `play_start` with `props.kind` `run`, then `play_end` with `props.result` `prestige`, `value` the prestige currency gained and `duration_ms` the time to prestige. A prestige counts as a completed run, not a win.
+
+| Event | Fields |
+|---|---|
+| `offline_reward` | `duration_ms` (time offline), `value`, `currency`, `props.multiplier` (1, 2, 3), `props.via` (`free`, `ad`, `iap`) |
+
+The Economy page shows the average time offline, the share taken with an ad, and the offline share of currency earned. Keep the event budget small: send `progress` on milestones, at session start and at prestige, never on every value change; summarize upgrade purchases per session in `session_end` props, such as `upgrades_bought`; aim for fewer than 15 events per session.
 
 ## Custom events
 

@@ -1,5 +1,5 @@
 // Dashboard reads. Pages read rollup tables, except the raw filters, the Events tail and the device timeline.
-import { DAY, QUIT_AFTER_MS } from "./rollup";
+import { DAY, QUIT_AFTER_MS, type SeenKeys } from "./rollup";
 
 export interface Filters {
   range: string; from: string; to: string; prevFrom: string; prevTo: string; days: number; compare: boolean;
@@ -77,7 +77,7 @@ interface ActivityRow { day: string; version: string; platform: string; country:
 interface CohortRow { first_day: string; day: string; version: string; platform: string; country: string; devices: number }
 export interface Kpis { dau: number; newUsers: number; sessions: number; sessionLength: number | null; playtimePerUser: number | null; d1: number | null; d7: number | null; stickiness: number | null }
 export interface LevelRow {
-  level: string; starts: number; players: number; wins: number; fails: number; quits: number; draws: number; abandons: number;
+  level: string; starts: number; players: number; wins: number; fails: number; quits: number; draws: number; abandons: number; prestiges: number;
   first_starts: number; first_try_wins: number;
   duration_sum: number; duration_n: number; stars_sum: number; stars_n: number; moves_left_sum: number; moves_left_n: number;
 }
@@ -92,7 +92,7 @@ const DISTINCT = `SELECT COUNT(DISTINCT device_id) AS n FROM device_days WHERE p
 /** Plays of the profile's kinds (?6, a JSON list; null for every kind). */
 const KINDS = "(?6 IS NULL OR kind IN (SELECT value FROM json_each(?6)))";
 const LEVELS = `SELECT level, SUM(starts) AS starts, SUM(wins) AS wins, SUM(fails) AS fails, SUM(quits) AS quits,
-  SUM(draws) AS draws, SUM(abandons) AS abandons, SUM(first_starts) AS first_starts,
+  SUM(draws) AS draws, SUM(abandons) AS abandons, SUM(prestiges) AS prestiges, SUM(first_starts) AS first_starts,
   -- Days rolled up before 0.2.1 have first_try_wins but no first_starts; leave them out of the ratio.
   SUM(CASE WHEN first_starts > 0 THEN first_try_wins ELSE 0 END) AS first_try_wins, SUM(duration_sum) AS duration_sum, SUM(duration_n) AS duration_n,
   SUM(stars_sum) AS stars_sum, SUM(stars_n) AS stars_n, SUM(moves_left_sum) AS moves_left_sum, SUM(moves_left_n) AS moves_left_n
@@ -125,6 +125,8 @@ export async function overview(db: D1Database, project: string, f: Filters, toda
       .bind(project, f.compare ? f.prevFrom : f.from, f.to),
     db.prepare(TOP_EVENTS).bind(project, f.from, f.to, f.v, f.p),
     db.prepare(LEVELS).bind(project, f.from, f.to, f.v, f.p, kinds),
+    db.prepare(`SELECT bucket, SUM(sessions) AS n FROM gap_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3
+      AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5) GROUP BY bucket`).bind(project, f.from, f.to, f.v, f.p),
   ]);
   const activity = res[0].results as unknown as ActivityRow[];
   const cohorts = res[3].results as unknown as CohortRow[];
@@ -167,6 +169,12 @@ export async function overview(db: D1Database, project: string, f: Filters, toda
     previous: f.compare ? kpis(f.prevFrom, f.prevTo, n(2)) : null,
     days, newByDay: byDay("players", 1), returningByDay: byDay("players", 0), sessionsByDay: byDay("sessions"),
     topEvents: res[4].results as unknown as { name: string; count: number }[],
+    gaps: new Map(res[6].results.map((r) => [r.bucket as string, r.n as number])),
+    sessionsPerPlayerDay: (() => {
+      const rows = keep.filter((r) => r.day >= f.from && r.day <= f.to);
+      const players = rows.reduce((t, r) => t + r.players, 0);
+      return players ? rows.reduce((t, r) => t + r.sessions, 0) / players : null;
+    })(),
     levels: levels.filter((l) => l.starts > 0).map((l) => ({ ...l, quitRate: l.quits / l.starts }))
       .sort((a, b) => b.quitRate - a.quitRate || b.starts - a.starts).slice(0, 5),
     options: { versions, countries, platforms },
@@ -197,32 +205,38 @@ export async function cohortTable(db: D1Database, project: string, f: Filters, t
   };
 }
 
-// Distinct players who started each level, from the levels each device day saw.
-const LEVEL_PLAYERS = `SELECT j.value AS level, COUNT(DISTINCT dd.device_id) AS players FROM device_days dd, json_each(dd.seen, '$.l') j
-  WHERE dd.project_id = ?1 AND dd.day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR dd.version = ?4) AND (?5 IS NULL OR dd.platform = ?5) GROUP BY j.value`;
+// Distinct players who started each play key of the kinds (?6), from what each device day saw: "kind\u001flevel",
+// or a bare level from before 0.3.1, which counts under any kind.
+const SEP = "instr(j.value, char(31))";
+const LEVEL_PLAYERS = `SELECT CASE WHEN ${SEP} THEN substr(j.value, ${SEP} + 1) ELSE j.value END AS level, COUNT(DISTINCT dd.device_id) AS players
+  FROM device_days dd, json_each(dd.seen, '$.l') j
+  WHERE dd.project_id = ?1 AND dd.day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR dd.version = ?4) AND (?5 IS NULL OR dd.platform = ?5)
+    AND (?6 IS NULL OR ${SEP} = 0 OR substr(j.value, 1, ${SEP} - 1) IN (SELECT value FROM json_each(?6)))
+  GROUP BY 1`;
 const END = "name IN ('level_complete', 'level_fail', 'level_quit', 'play_end')";
 const isMetric = (t: string) => `json_type(props, '$.${t}') IN ('integer', 'real')`;
 // One row per level, device and attempt (session when no attempt), then summed per level, as the rollup counts.
 // play_end is read through props.result, and level_* events as plays of kind level, as the rollup does.
 const RESULT = (r: string, level: string) => `(name = '${level}' OR (name = 'play_end' AND json_extract(props, '$.result') = '${r}'))`;
 const START = "name IN ('level_start', 'play_start')";
-const RAW_LEVELS = (where: string) => `SELECT level, SUM(s) AS starts, COUNT(DISTINCT CASE WHEN s > 0 THEN device_id END) AS players,
-  SUM(w) AS wins, SUM(fl) AS fails, SUM(q + (s > 0 AND w + fl + q + dr + ab = 0 AND ls < ?)) AS quits, SUM(dr) AS draws, SUM(ab) AS abandons,
+const RAW_LEVELS = (where: string) => `SELECT lv AS level, SUM(s) AS starts, COUNT(DISTINCT CASE WHEN s > 0 THEN device_id END) AS players,
+  SUM(w) AS wins, SUM(fl) AS fails, SUM(q + (s > 0 AND w + fl + q + dr + ab + pr = 0 AND ls < ?)) AS quits, SUM(dr) AS draws, SUM(ab) AS abandons,
+  SUM(pr) AS prestiges,
   SUM(CASE WHEN a = 1 THEN s ELSE 0 END) AS first_starts, SUM(CASE WHEN a = 1 THEN w ELSE 0 END) AS first_try_wins,
   TOTAL(ds) AS duration_sum, SUM(dn) AS duration_n, TOTAL(ss) AS stars_sum, SUM(sn) AS stars_n, TOTAL(ms) AS moves_left_sum, SUM(mn) AS moves_left_n
-  FROM (SELECT level, device_id, MAX(attempt) AS a, SUM(${START}) AS s, SUM(${RESULT("win", "level_complete")}) AS w,
+  FROM (SELECT COALESCE(level, '(none)') AS lv, device_id, MAX(attempt) AS a, SUM(${START}) AS s, SUM(${RESULT("win", "level_complete")}) AS w,
     SUM(${RESULT("loss", "level_fail")}) AS fl, SUM(${RESULT("quit", "level_quit")}) AS q,
-    SUM(${RESULT("draw", "-")}) AS dr, SUM(${RESULT("abandon", "-")}) AS ab, MAX(CASE WHEN ${START} THEN received_at END) AS ls,
+    SUM(${RESULT("draw", "-")}) AS dr, SUM(${RESULT("abandon", "-")}) AS ab, SUM(${RESULT("prestige", "-")}) AS pr, MAX(CASE WHEN ${START} THEN received_at END) AS ls,
     SUM(CASE WHEN ${END} THEN duration_ms END) AS ds, COUNT(CASE WHEN ${END} THEN duration_ms END) AS dn,
     SUM(CASE WHEN ${RESULT("win", "level_complete")} AND ${isMetric("stars")} THEN json_extract(props, '$.stars') END) AS ss,
     COUNT(CASE WHEN ${RESULT("win", "level_complete")} AND ${isMetric("stars")} THEN 1 END) AS sn,
     SUM(CASE WHEN ${RESULT("win", "level_complete")} AND ${isMetric("moves_left")} THEN json_extract(props, '$.moves_left') END) AS ms,
     COUNT(CASE WHEN ${RESULT("win", "level_complete")} AND ${isMetric("moves_left")} THEN 1 END) AS mn
-    FROM events WHERE ${where} AND level IS NOT NULL AND (${START} OR ${END})
+    FROM events WHERE ${where} AND (${START} OR ${END})
       AND (?${"KINDS"} IS NULL OR COALESCE(json_extract(props, '$.kind'), CASE WHEN name LIKE 'level%' THEN 'level' ELSE 'play' END)
         IN (SELECT value FROM json_each(?${"KINDS"})))
-    GROUP BY level, device_id, COALESCE(attempt, session_id))
-  GROUP BY level ORDER BY CAST(level AS INTEGER), level`;
+    GROUP BY lv, device_id, COALESCE(attempt, session_id))
+  GROUP BY lv ORDER BY CAST(lv AS INTEGER), lv`;
 
 export interface Results { key: string; starts: number; wins: number; fails: number; quits: number; draws: number; abandons: number }
 export interface DimRow { value: string; plays: number; players: number; wins: number; losses: number; draws: number; score_sum: number; score_n: number }
@@ -249,7 +263,7 @@ export async function levelTable(db: D1Database, project: string, f: Filters, tz
   const b = [project, f.from, f.to, f.v, f.p, kinds];
   const res = await db.batch<Record<string, unknown>>([
     db.prepare(LEVELS).bind(...b),
-    db.prepare(LEVEL_PLAYERS).bind(project, f.from, f.to, f.v, f.p),
+    db.prepare(LEVEL_PLAYERS).bind(...b),
     db.prepare(BY("mode")).bind(...b),
     db.prepare(BY("difficulty")).bind(...b),
     db.prepare(DIM).bind(...b, "opponent"),
@@ -277,20 +291,23 @@ export async function progressPage(db: D1Database, project: string, f: Filters) 
   return { rowsRead: rowsRead(res), rows: res[0].results as unknown as TrackRow[] };
 }
 
-export interface StepRow { flow: string; step: number; devices: number; duration_sum: number; duration_n: number }
+export interface StepRow { flow: string; step: number; devices: number; duration_sum: number; duration_n: number; skips: number }
 export async function flowsPage(db: D1Database, project: string, f: Filters) {
   const res = await db.batch<Record<string, unknown>>([db.prepare(`SELECT flow, step, SUM(devices) AS devices, SUM(duration_sum) AS duration_sum,
-    SUM(duration_n) AS duration_n FROM step_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4)
+    SUM(duration_n) AS duration_n, SUM(skips) AS skips FROM step_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4)
     AND (?5 IS NULL OR platform = ?5) GROUP BY flow, step ORDER BY flow, step LIMIT 500`).bind(project, f.from, f.to, f.v, f.p)]);
   return { rowsRead: rowsRead(res), rows: res[0].results as unknown as StepRow[] };
 }
 
-/** The props keys most used on play events among the newest 200 raw events of the last 7 days, as dimension suggestions. */
-export async function suggestDims(db: D1Database, project: string, now: number) {
-  const res = await db.batch<Record<string, unknown>>([db.prepare(`SELECT j.key AS key, COUNT(*) AS n FROM
-    (SELECT name, props FROM events WHERE project_id = ?1 AND received_at >= ?2 ORDER BY received_at DESC LIMIT 200) e, json_each(e.props) j
-    WHERE e.name IN ('play_start', 'play_end', 'level_start', 'level_complete', 'level_fail') AND j.type = 'text' AND j.key NOT IN ('kind', 'result', 'reason', 'step_id') GROUP BY j.key ORDER BY n DESC, j.key LIMIT 8`).bind(project, now - 7 * DAY)]);
-  return { rowsRead: rowsRead(res), keys: res[0].results.map((r) => r.key as string) };
+/** Tracks, play props keys and flows the rollup saw in the last 7 days (since day), for the Settings form. One row. */
+export async function seenKeys(db: D1Database, project: string, since: string) {
+  const res = await db.batch<Record<string, unknown>>([db.prepare("SELECT seen_keys FROM projects WHERE id = ?").bind(project)]);
+  const s: SeenKeys = res[0].results[0]?.seen_keys ? JSON.parse(res[0].results[0].seen_keys as string) : { t: {}, k: {}, f: {} };
+  const recent = (m: Record<string, string>) => Object.keys(m).filter((k) => m[k] >= since).sort();
+  return {
+    rowsRead: rowsRead(res), tracks: recent(s.t), flows: recent(s.f),
+    keys: Object.entries(s.k).filter(([, e]) => e.d >= since).map(([key, e]) => ({ key, values: e.v.length })).sort((a, b) => a.key.localeCompare(b.key)),
+  };
 }
 
 /** One play key by day and by version from play_days, with its fail and quit reasons, boosters and continues. */
@@ -381,7 +398,7 @@ export async function devicePage(db: D1Database, project: string, f: Filters, tz
     rowsRead: rowsRead(res),
     device: (res[0].results[0] ?? null) as { first_day: string; version: string; platform: string; country: string } | null,
     days: res[1].results.map((r) => {
-      const levels = (JSON.parse(r.seen as string).l as string[]).map(Number).filter(Number.isFinite);
+      const levels = (JSON.parse(r.seen as string).l as string[]).map((l) => Number(l.split("\u001f").at(-1))).filter(Number.isFinite);
       return { day: r.day as string, sessions: r.sessions as number, playtime: r.playtime_ms as number, events: r.events as number,
         level: levels.length ? Math.max(...levels) : null };
     }),
@@ -392,12 +409,12 @@ export async function devicePage(db: D1Database, project: string, f: Filters, tz
 const USE = new Set(["booster_used", "booster_bought", "try_taken"]);
 const OFFER = new Set(["booster_offered", "try_offer_shown"]);
 const AD_SHOWN = new Set(["ad_shown", "interstitial_shown", "continue_watched"]);
-interface EconRow { day: string; name: string; currency: string; detail: string; n: number; v: number }
+interface EconRow { day: string; name: string; currency: string; detail: string; n: number; v: number; ds: number }
 
 /** Economy and ads from econ_days: currency flows, boosters, ads by format and revenue with ARPDAU. */
 export async function economy(db: D1Database, project: string, f: Filters) {
   const res = await db.batch<Record<string, unknown>>([
-    db.prepare(`SELECT day, name, currency, detail, SUM(count) AS n, SUM(value_sum) AS v FROM econ_days
+    db.prepare(`SELECT day, name, currency, detail, SUM(count) AS n, SUM(value_sum) AS v, SUM(duration_sum) AS ds FROM econ_days
       WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5)
       GROUP BY day, name, currency, detail`).bind(project, f.from, f.to, f.v, f.p),
     db.prepare(`SELECT COUNT(*) AS n FROM device_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3
@@ -410,7 +427,14 @@ export async function economy(db: D1Database, project: string, f: Filters) {
   const boosters = new Map<string, { used: number; offered: number }>();
   const ads = new Map<string, { shown: number; revenue: number; byDay: Map<string, number> }>();
   const revenue = new Map<string, { ads: number; iap: number }>();
+  const offline = new Map<string, { rewards: number; value: number; ms: number; ad: number }>();
   for (const r of rows) {
+    if (r.name === "offline_reward") {
+      const o = offline.get(r.currency) ?? { rewards: 0, value: 0, ms: 0, ad: 0 };
+      o.rewards += r.n; o.value += r.v; o.ms += r.ds;
+      if (r.detail === "ad") o.ad += r.n;
+      offline.set(r.currency, o);
+    }
     if (r.name === "currency_earned" || r.name === "currency_spent") {
       const c = currencies.get(r.currency) ?? { earned: 0, spent: 0, earnedByDay: new Map(), spentByDay: new Map(), sources: new Map(), sinks: new Map() };
       const earned = r.name === "currency_earned";
@@ -444,6 +468,11 @@ export async function economy(db: D1Database, project: string, f: Filters) {
     ads: [...ads].sort((a, b) => b[1].shown - a[1].shown).map(([format, a]) => ({
       format, shown: a.shown, revenue: a.revenue, byDay: days.map((d) => a.byDay.get(d) ?? 0),
     })),
+    // Offline share: offline reward value / (offline reward value + currency_earned value), per currency.
+    offline: [...offline].sort((a, b) => b[1].value - a[1].value).map(([currency, o]) => {
+      const earned = currencies.get(currency)?.earned ?? 0;
+      return { currency, rewards: o.rewards, value: o.value, share: o.value / (o.value + earned || 1), avgMs: o.ms / o.rewards, adShare: o.ad / o.rewards };
+    }),
     revenue: [...revenue].map(([currency, m]) => ({ currency, ...m, total: m.ads + m.iap, arpdau: deviceDays ? (m.ads + m.iap) / deviceDays : null })),
     deviceDays,
   };

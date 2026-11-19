@@ -1,6 +1,7 @@
 // Game profiles (docs/09-game-profiles.md section 3): how the rollups and the dashboard read a project's events.
 
-export interface Track { key: string; label?: string; milestones: number[] }
+/** A log10 track buckets by powers of ten; its milestones default to LOG_MILESTONES. */
+export interface Track { key: string; label?: string; milestones: number[]; scale?: "log10" }
 export interface Dim { key: string; label?: string; multi?: boolean }
 export interface Profile {
   preset: string; play_label: string; play_kinds: string[]; tracks: Track[]; dimensions: Dim[]; flows: string[];
@@ -23,22 +24,43 @@ export const PRESETS: Record<string, Profile> = {
     tracks: [{ key: "best_score", label: "Best score", milestones: [1000, 5000, 10000] }, { key: "account_level", label: "Account level", milestones: [5, 10, 20] }],
     dimensions: [{ key: "character" }, { key: "biome" }], flows: [],
   },
+  // A run is one prestige cycle (docs/10-v0.3.1.md section 2).
   idle_tycoon: {
-    preset: "idle_tycoon", play_label: "Session", play_kinds: ["session"],
-    tracks: [{ key: "stage", label: "Stage", milestones: [10, 50, 100] }, { key: "prestige", label: "Prestige", milestones: [1, 5, 10] }],
-    dimensions: [{ key: "building" }], flows: [],
+    preset: "idle_tycoon", play_label: "Run", play_kinds: ["run"],
+    tracks: [{ key: "stage", label: "Stage", milestones: [10, 50, 100, 500] }, { key: "prestige_count", label: "Prestiges", milestones: [1, 5, 10, 25] },
+      { key: "income_per_sec", label: "Income per second", milestones: [1e3, 1e6, 1e9, 1e12, 1e15, 1e18], scale: "log10" },
+      { key: "account_level", label: "Account level", milestones: [5, 10, 20] }],
+    dimensions: [{ key: "building" }, { key: "upgrade" }, { key: "boost" }, { key: "offer" }], flows: ["ftue"],
   },
 };
+export const LOG_MILESTONES = [1e3, 1e6, 1e9, 1e12, 1e15, 1e18, 1e21, 1e24, 1e27, 1e30];
 const KIND_PRESET: Record<string, string> = { level: "puzzle_levels", match: "match_battle", round: "match_battle", run: "run_roguelike", session: "idle_tycoon" };
+const kindPreset = (kind: string, idle: boolean) =>
+  kind === "run" && idle ? "idle_tycoon" : Object.hasOwn(KIND_PRESET, kind) ? KIND_PRESET[kind] : null;
+const isIdle = (r: { name: string; props: Record<string, unknown> }) =>
+  r.name === "offline_reward" || (r.name === "play_end" && r.props.result === "prestige") || (r.name === "progress" && (r.props.track === "stage" || r.props.track === "prestige_count"));
 
-/** The preset a chunk of events suggests, from its play kinds and tracks; null when it says nothing. */
+/** The preset a chunk of events suggests, from its first play kind and any idle event; null when it says nothing. */
 export function detect(rows: { name: string; props: Record<string, unknown> }[]): string | null {
-  for (const r of rows) {
-    if (r.name.startsWith("level_")) return "puzzle_levels";
-    if (r.name === "play_start" || r.name === "play_end") return Object.hasOwn(KIND_PRESET, String(r.props.kind)) ? KIND_PRESET[String(r.props.kind)] : null;
-    if (r.name === "progress" && (r.props.track === "stage" || r.props.track === "prestige")) return "idle_tycoon";
-  }
-  return null;
+  const idle = rows.some(isIdle);
+  const play = rows.find((r) => r.name.startsWith("level_") || r.name === "play_start" || r.name === "play_end");
+  if (!play) return idle ? "idle_tycoon" : null;
+  return kindPreset(play.name.startsWith("level_") ? "level" : String(play.props.kind), idle);
+}
+
+/**
+ * The preset the last days of rollups suggest: the play kind with the most plays; idle when a run prestiges or offline rewards
+ * come in. To avoid rebuilding back and forth, the old preset stays while its play kinds still have plays, except that a run
+ * game turns idle; an idle game never turns back into run_roguelike.
+ */
+export function detectFrom(kinds: { kind: string; n: number; prestiges: number }[], offline: number, old: string | null = null): string | null {
+  const top = kinds.filter((k) => k.n > 0).sort((a, b) => b.n - a.n || a.kind.localeCompare(b.kind))[0];
+  const idle = offline > 0 || kinds.some((k) => k.prestiges > 0);
+  const next = top ? kindPreset(top.kind, idle) : idle ? "idle_tycoon" : null;
+  if (!old || !next || next === old || !Object.hasOwn(PRESETS, old)) return next;
+  if (old === "run_roguelike" && next === "idle_tycoon") return next;
+  if (old === "idle_tycoon" && next === "run_roguelike") return old;
+  return kinds.some((k) => k.n > 0 && PRESETS[old].play_kinds.includes(k.kind)) ? old : next;
 }
 
 /** The saved profile, else the detected preset, else null. */
@@ -70,9 +92,12 @@ export function parseProfile(v: unknown): Profile {
     tracks: has("tracks") ? list(o.tracks, 5, (t) => {
       const r = t as Record<string, unknown>;
       const milestones = list(r?.milestones, 20, (m) => { if (typeof m !== "number" || !Number.isFinite(m)) throw new Error("milestones must be numbers"); return m; });
-      return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}), milestones: [...new Set(milestones)].sort((a, b) => a - b) };
+      if (r?.scale !== undefined && r.scale !== "linear" && r.scale !== "log10") throw new Error("scale must be linear or log10");
+      const log = r?.scale === "log10";
+      return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}),
+        milestones: milestones.length || !log ? [...new Set(milestones)].sort((a, b) => a - b) : LOG_MILESTONES, ...(log ? { scale: "log10" as const } : {}) };
     }) : base.tracks,
-    dimensions: has("dimensions") ? list(o.dimensions, 10, (d) => {
+    dimensions: has("dimensions") ? list(o.dimensions, 12, (d) => {
       const r = d as Record<string, unknown>;
       return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}), ...(r?.multi === true ? { multi: true } : {}) };
     }).filter((d, i, all) => { if (all.findIndex((x) => x.key === d.key) !== i) throw new Error(`dimension ${d.key} is declared twice`); return true; }) : base.dimensions,

@@ -42,7 +42,7 @@ export async function rows(sql = "SELECT * FROM events ORDER BY client_ts, event
 }
 
 export async function reset() {
-  await env.DB.batch(["events", "projects", "usage", "devices", "device_days", "cohort_days", "play_days", "event_days", "level_events", "econ_days", "keys", "dim_days", "track_days", "step_days"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
+  await env.DB.batch(["events", "projects", "usage", "devices", "device_days", "cohort_days", "play_days", "event_days", "level_events", "econ_days", "keys", "dim_days", "track_days", "step_days", "gap_days"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
 }
 
 let stored = 0;

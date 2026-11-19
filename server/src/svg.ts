@@ -2,7 +2,16 @@ import { esc } from "./html";
 
 // Narrow viewBox so SVG text stays readable on a phone; CSS caps the width on desktop.
 const W = 420;
-const fmt = (n: number) => n.toLocaleString("en-US", { maximumFractionDigits: 1 });
+const SUFFIX = ["", "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No"];
+/** Idle game sized numbers: 1.5K, 2M, 3Qa, up to No (1e30), then scientific notation such as 1.2e33. */
+export function big(n: number): string {
+  const a = Math.abs(n);
+  if (a < 1000) return String(Math.round(n * 10) / 10);
+  if (a >= 1e33) return n.toExponential(1).replace("e+", "e");
+  const k = Math.floor(Math.log10(a) / 3);
+  return `${Math.round((n / 10 ** (3 * k)) * 10) / 10}${SUFFIX[k]}`;
+}
+const fmt = (n: number) => (Math.abs(n) >= 1e6 ? big(n) : n.toLocaleString("en-US", { maximumFractionDigits: 1 }));
 
 interface Series { name: string; cls: string; values: number[] }
 
@@ -14,28 +23,32 @@ const niceMax = (v: number) => {
 
 /**
  * Stacked bars per day with an optional line on the same count axis. Each day links to href(day),
- * so a click applies that day as the range. Hover shows the day's values.
+ * so a click applies that day as the range. Hover shows the day's values. With log, the axis is log10(1 + value).
  */
-export function dayBars(days: string[], stacks: Series[], line: Series | null, href: (day: string) => string): string {
+export function dayBars(days: string[], stacks: Series[], line: Series | null, href: (day: string) => string, log = false): string {
   if (!days.length) return `<p class="empty">No days in range.</p>`;
   const H = 190, L = 30, R = 6, T = 10, B = 22, plot = H - T - B;
   const totals = days.map((_, i) => stacks.reduce((t, s) => t + s.values[i], 0));
-  const max = niceMax(Math.max(1, ...totals, ...(line?.values ?? [])));
+  const top = Math.max(1, ...totals, ...(line?.values ?? []));
+  /** Axis position of a value, from 0 to max. */
+  const t = (v: number) => (log ? Math.log10(1 + Math.max(0, v)) : v);
+  const max = log ? Math.ceil(t(top)) : niceMax(top);
   const slot = (W - L - R) / days.length;
   const bw = Math.max(1, Math.min(24, slot - 2));
-  const y = (v: number) => T + plot * (1 - v / max);
-  const grid = [0, 0.5, 1].map((f) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(max * f)}" y2="${y(max * f)}"/>`
-    + `<text class="axis" x="${L - 6}" y="${y(max * f) + 4}" text-anchor="end">${fmt(max * f)}</text>`).join("");
+  const y = (v: number) => T + plot * (1 - t(v) / max);
+  const at = (f: number) => (log ? 10 ** (max * f) - 1 : max * f);
+  const grid = [0, 0.5, 1].map((f) => `<line class="grid" x1="${L}" x2="${W - R}" y1="${y(at(f))}" y2="${y(at(f))}"/>`
+    + `<text class="axis" x="${L - 6}" y="${y(at(f)) + 4}" text-anchor="end">${fmt(log ? Math.round(at(f)) : at(f))}</text>`).join("");
   const tickAt = [...new Set([0, Math.floor((days.length - 1) / 2), days.length - 1])];
   const ticks = tickAt.map((i, k) => `<text class="axis" x="${L + (i + 0.5) * slot}" y="${H - 6}"
     text-anchor="${tickAt.length > 1 && k === 0 ? "start" : k === tickAt.length - 1 && k > 0 ? "end" : "middle"}">${esc(days[i].slice(5))}</text>`).join("");
   const cols = days.map((d, i) => {
     const x = L + i * slot;
-    let top = y(0);
+    let sum = 0;
     const segs = stacks.map((s) => {
-      const h = (plot * s.values[i]) / max;
-      top -= h;
-      return h > 0 ? `<rect class="bar ${s.cls}" x="${x + (slot - bw) / 2}" y="${top}" width="${bw}" height="${h}"/>` : "";
+      const h = y(sum) - y(sum + s.values[i]);
+      sum += s.values[i];
+      return h > 0 ? `<rect class="bar ${s.cls}" x="${x + (slot - bw) / 2}" y="${y(sum)}" width="${bw}" height="${h}"/>` : "";
     }).join("");
     const tip = [...stacks, ...(line ? [line] : [])].map((s) => `${s.name} ${fmt(s.values[i])}`).join(", ");
     return `<a href="${esc(href(d))}"><title>${esc(d)}: ${esc(tip)}</title><rect class="hit" x="${x}" y="${T}" width="${slot}" height="${plot}"/>${segs}</a>`;

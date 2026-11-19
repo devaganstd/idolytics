@@ -97,7 +97,7 @@ A preset fills the profile with defaults. The developer edits from there.
 | `puzzle_levels` | Ninja Smash | `level`, ordered keys | `level` | `booster`, `difficulty` |
 | `match_battle` | Hex Battle Ground | `match` | `trophies`, `arena` | `board`, `mode`, `difficulty`, `deck` (multi) |
 | `run_roguelike` | runner, survivor | `run` | `best_score`, `account_level` | `character`, `biome` |
-| `idle_tycoon` | idle, tycoon | `session` | `stage`, `prestige` | `building` |
+| `idle_tycoon` | idle, tycoon | `run` (one prestige cycle, from v0.3.1) | `stage`, `prestige_count`, `income_per_sec` (log10), `account_level` | `building`, `upgrade`, `boost`, `offer` |
 
 ### 3.2 Automatic detection
 

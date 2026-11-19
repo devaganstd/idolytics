@@ -125,3 +125,54 @@ export async function seedAsPlays() {
     await env.DB.prepare("UPDATE events SET name = ?, props = ? WHERE event_id = ?").bind(name, JSON.stringify(props), r.event_id).run();
   }
 }
+
+/**
+ * Hand counted idle game data, as SDK 0.2.1 sends it. i1 (android) and i2 (ios) install on 11-01. A run is one prestige cycle,
+ * sent without a level, so it rolls up under the play key "(none)".
+ *   Runs: i1 #1 08:05 11-01 to prestige 18:05 11-01 (value 5, 10 h, boost x2); i1 #2 18:06 11-01 to prestige 09:05 11-02 (12, 15 h, boost x2);
+ *         i2 #1 12:05 11-01 to prestige 20:05 11-02 (3, 32 h); i1 #3 09:06 11-02, never ended: an inferred quit.
+ *   Session gaps (since_last_ms): i1 30 min and 6 h on 11-01, 14 h on 11-02; i2 30 h and 2 h on 11-02. First sessions have none.
+ *   Offline rewards (coins): i1 30 min free 1000 on 11-01, 14 h ad x2 2e12 on 11-02; i2 30 h ad x3 3e15 on 11-02. i1 earns 3e15 coins by tapping.
+ *   Income per second (log10): i1 5000 on 11-01, 2e6 on 11-02; i2 500 on 11-01, 7e9 on 11-02.
+ *   Tutorial: i2 begins, step 1, skips at step 2.
+ */
+export async function seedIdle() {
+  const ios = { platform: "ios", country: "US" };
+  const e = (name: string, device: string, session: string, ts: number, more: Record<string, unknown> = {}) =>
+    raw({ name, device, session: device + session, ts, ...(device === "i2" ? ios : {}), ...more });
+  const H = 3_600_000;
+  const start = (device: string, s: string, ts: number, gap?: number) => e("session_start", device, s, ts, gap === undefined ? {} : { props: { since_last_ms: gap } });
+  const run = (device: string, s: string, ts: number, attempt: number) => e("play_start", device, s, ts, { attempt, props: { kind: "run" } });
+  const prestige = (device: string, s: string, ts: number, attempt: number, value: number, duration: number, boost?: string) =>
+    e("play_end", device, s, ts, { attempt, value, duration, props: { kind: "run", result: "prestige", ...(boost ? { boost } : {}) } });
+  const income = (device: string, s: string, ts: number, value: number) => e("progress", device, s, ts, { value, props: { track: "income_per_sec" } });
+  const offline = (device: string, s: string, ts: number, duration: number, value: number, multiplier: number, via: string) =>
+    e("offline_reward", device, s, ts, { duration, value, currency: "coins", props: { multiplier, via } });
+
+  await start("i1", "a", at(0, 8));
+  await run("i1", "a", at(0, 8, 5), 1);
+  await income("i1", "a", at(0, 8, 10), 5000);
+  await start("i1", "b", at(0, 10), 30 * MIN);
+  await offline("i1", "b", at(0, 10) + 30_000, 30 * MIN, 1000, 1, "free");
+  await e("currency_earned", "i1", "b", at(0, 10, 1), { value: 3e15, currency: "coins", props: { source: "tap" } });
+  await start("i1", "c", at(0, 18), 6 * H);
+  await prestige("i1", "c", at(0, 18, 5), 1, 5, 10 * H, "x2");
+  await run("i1", "c", at(0, 18, 6), 2);
+  await start("i1", "d", at(1, 9), 14 * H);
+  await offline("i1", "d", at(1, 9) + 30_000, 14 * H, 2e12, 2, "ad");
+  await prestige("i1", "d", at(1, 9, 5), 2, 12, 15 * H, "x2");
+  await run("i1", "d", at(1, 9, 6), 3);
+  await income("i1", "d", at(1, 9, 10), 2e6);
+
+  await start("i2", "a", at(0, 12));
+  await e("tutorial_begin", "i2", "a", at(0, 12, 1));
+  await e("tutorial_step", "i2", "a", at(0, 12, 2), { props: { step: 1 } });
+  await e("tutorial_skip", "i2", "a", at(0, 12, 3), { props: { step: 2 } });
+  await run("i2", "a", at(0, 12, 5), 1);
+  await income("i2", "a", at(0, 12, 10), 500);
+  await start("i2", "b", at(1, 20), 30 * H);
+  await offline("i2", "b", at(1, 20) + 30_000, 30 * H, 3e15, 3, "ad");
+  await prestige("i2", "b", at(1, 20, 5), 1, 3, 32 * H);
+  await income("i2", "b", at(1, 20, 10), 7e9);
+  await start("i2", "c", at(1, 21), 2 * H);
+}

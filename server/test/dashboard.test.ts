@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { parseTz, tzLabel } from "../src/dashboard";
-import { at, NOW, seed, seedAsPlays, seedEconomy, seedMatch } from "./fixture";
+import { at, NOW, seed, seedAsPlays, seedEconomy, seedIdle, seedMatch } from "./fixture";
+import { PRESETS } from "../src/profile";
 import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
@@ -441,25 +442,133 @@ describe("game profiles: plays, progress, content and flows", () => {
     expect(cells(t, "Complete")).toEqual(["Complete", "1", "0%", "2m 00s"]);
   });
 
-  it("shows the detected preset and saves a profile, which rebuilds the rollups", async () => {
+  const save = (body: string, origin = BASE) => exports.default.fetch(new Request(`${BASE}/settings/profile`, {
+    method: "POST", redirect: "manual", headers: { ...AUTH, Origin: origin, "Content-Type": "application/x-www-form-urlencoded" }, body,
+  }));
+  const saved = async () => JSON.parse((await env.DB.prepare("SELECT profile FROM projects WHERE id = 'demo'").first<{ profile: string }>())!.profile);
+  const unesc = (v: string) => v.replace(/&(amp|lt|gt|quot|#39);/g, (_, c) => ({ amp: "&", lt: "<", gt: ">", quot: '"', "#39": "'" })[c as string]!);
+  /** The fields a browser would post for a form: text and hidden inputs, checked boxes and selected options. */
+  const formBody = (form: string) => {
+    const q = new URLSearchParams({ project: "demo" });
+    for (const m of form.matchAll(/<input([^>]*)>/g)) {
+      const a = (k: string) => m[1].match(new RegExp(`\\b${k}="([^"]*)"`))?.[1];
+      if (!a("name") || a("name") === "project" || (a("type") === "checkbox" && !/\bchecked\b/.test(m[1]))) continue;
+      q.append(a("name")!, unesc(a("value") ?? ""));
+    }
+    for (const m of form.matchAll(/<select name="([^"]+)">([\s\S]*?)<\/select>/g)) {
+      q.append(m[1], unesc((m[2].match(/<option value="([^"]*)" selected/) ?? m[2].match(/<option value="([^"]*)"/))![1]));
+    }
+    return q.toString();
+  };
+  const profileForm = (html: string) => html.slice(html.indexOf('<form method="post" action="/settings/profile" class="profile">'), html.indexOf("</form>", html.indexOf('class="profile"')));
+
+  it("round trips every preset through the profile form", async () => {
+    for (const preset of Object.keys(PRESETS)) {
+      const html = await (await get(`/settings?project=demo&preset=${preset}`)).text();
+      expect(html).toContain(`<option value="${preset}" selected>`);
+      expect((await save(formBody(profileForm(html)))).status).toBe(303);
+      expect(await saved()).toEqual(PRESETS[preset]);
+      // The saved profile renders the same form again.
+      const again = await (await get("/settings?project=demo")).text();
+      expect(formBody(profileForm(again))).toBe(formBody(profileForm(html)));
+    }
+    // Unchecking a track, a dimension and a flow, and adding a log10 track.
+    const html = await (await get("/settings?project=demo&preset=idle_tycoon")).text();
+    const body = formBody(profileForm(html)).replace("t_on=0&", "").replace("d_on=0&", "").replace("&flow=ftue", "")
+      .replace(/t_key_4=&/, "t_key_4=power&").replace(/t_ms_4=&/, "t_ms_4=1e6%2C+1e3&").replace(/t_scale_4=linear/, "t_scale_4=log10").replace(/t_on=3&/, "t_on=3&t_on=4&");
+    expect((await save(body)).status).toBe(303);
+    const p = await saved();
+    expect(p.tracks.map((t: { key: string }) => t.key)).toEqual(["prestige_count", "income_per_sec", "account_level", "power"]);
+    expect(p.tracks[3]).toEqual({ key: "power", milestones: [1000, 1e6], scale: "log10" });
+    expect(p.dimensions.map((d: { key: string }) => d.key)).toEqual(["upgrade", "boost", "offer"]);
+    expect(p.flows).toEqual([]);
+    expect((await save("project=demo&form=1&preset=nope&play_label=")).status).toBe(400);
+  });
+
+  it("suggests the tracks, dimensions and flows of the last 7 days, under 150 rows read", async () => {
     await seedMatch();
     await rollUp(NOW);
-    vi.setSystemTime(NOW); // suggestions read the last 7 days of raw events
+    vi.setSystemTime(NOW);
+    const res = await get("/settings?project=demo");
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeLessThan(150);
+    const html = await res.text();
+    expect(html).toContain('<option value="match_battle" selected>match_battle (Detected)</option>');
+    const form = profileForm(html);
+    for (const key of ["trophies", "arena"]) expect(form).toMatch(new RegExp(`name="t_key_\\d" value="${key}"`));
+    expect(form).toMatch(/value="deck"[^]*?6 values/);
+    expect(form).toMatch(/value="opponent"[^]*?1 value</);
+    expect(form).toMatch(/name="flow" value="tutorial1"/);
+    expect(form).toMatch(/name="flow" value="tutorial"/);
+    // Older than 7 days: only the saved or detected profile's own fields.
+    vi.setSystemTime(at(20, 12));
+    const old = profileForm(await (await get("/settings?project=demo")).text());
+    expect(old).not.toContain('value="tutorial1"');
+    expect(old).toContain('value="deck"');
+  });
+
+  it("shows the detected preset and saves a profile from a preset or JSON, which rebuilds the rollups", async () => {
+    await seedMatch();
+    await rollUp(NOW);
     const html = await (await get("/settings?project=demo")).text();
     expect(html).toContain("Detected: match_battle");
-    expect(html).toMatch(/Suggested dimensions:[^<]*deck/);
-    const save = (body: string, origin = BASE) => exports.default.fetch(new Request(`${BASE}/settings/profile`, {
-      method: "POST", redirect: "manual", headers: { ...AUTH, Origin: origin, "Content-Type": "application/x-www-form-urlencoded" }, body,
-    }));
+    expect(html).toContain("<summary>Advanced</summary>");
     expect((await save("project=demo&preset=run_roguelike")).status).toBe(303);
     const p = await env.DB.prepare("SELECT profile, tz_min, rollup_tz FROM projects").first<{ profile: string; tz_min: number; rollup_tz: number }>();
     expect(JSON.parse(p!.profile)).toMatchObject({ preset: "run_roguelike", play_label: "Run" });
     expect(p!.rollup_tz).not.toBe(p!.tz_min);
+    expect(await (await get("/settings?project=demo")).text()).toContain("Rebuilding");
     const custom = JSON.stringify({ preset: "match_battle", play_label: "Duel", play_kinds: ["match"], dimensions: [{ key: "deck", multi: true }] });
     expect((await save(`project=demo&profile=${encodeURIComponent(custom)}`)).status).toBe(303);
-    expect(JSON.parse((await env.DB.prepare("SELECT profile FROM projects").first<{ profile: string }>())!.profile)).toMatchObject({ play_label: "Duel" });
+    expect(await saved()).toMatchObject({ play_label: "Duel" });
     expect((await save("project=demo&profile=%7Bnope")).status).toBe(400);
     expect((await save(`project=demo&profile=${encodeURIComponent(JSON.stringify({ dimensions: "x" }))}`)).status).toBe(400);
     expect((await save("project=demo&preset=run_roguelike", "https://evil.example")).status).toBe(403);
+  });
+
+  it("shows idle runs, log10 progress, session gaps, offline rewards and tutorial skips", async () => {
+    await seedIdle();
+    await rollUp(NOW);
+    const runs = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(runs).toMatch(/>Runs<\/a>/);
+    expect(cells(runs, "Run ↑")).toEqual(["Run ↑", "Starts", "Players", "Wins", "Losses", "Quits (inferred)", "Prestiges", "Win rate",
+      "First try win rate", "Attempts per win", "Avg duration"]);
+    expect(cells(runs, "(none)")).toEqual(["(none)", "4", "2", "0", "0", "1", "3", "–", "0%", "–", "19h 00m"]);
+
+    const progress = section(await (await get(`/progress?project=demo&${RANGE}`)).text(), "Income per second");
+    expect(cells(progress, "Below 1K")).toEqual(["Below 1K", "1", "–", "–", "–"]);
+    expect(cells(progress, "1K+")).toEqual(["1K+", "1", "2", "0.5", "0"]);
+    expect(cells(progress, "1M+")).toEqual(["1M+", "1", "2", "1.0", "1"]);
+    expect(cells(progress, "1B+")).toEqual(["1B+", "1", "1", "1.0", "1"]);
+
+    const overview = await (await get(`/?project=demo&${RANGE}`)).text();
+    const rhythm = section(overview, "Session rhythm");
+    expect(rhythm).toContain("1.8 sessions per player per day");
+    for (const [label, n] of [["Under 1 h", 1], ["1 to 4 h", 1], ["4 to 12 h", 1], ["12 to 24 h", 1], ["Over 24 h", 1]]) {
+      expect(rhythm).toContain(`<title>${label}: ${n}</title>`);
+    }
+
+    const econ = await (await get(`/economy?project=demo&${RANGE}`)).text();
+    expect(cells(section(econ, "Offline rewards"), "coins")).toEqual(["coins", "3", "3Qa", "50%", "14h 50m", "67%"]);
+    expect(econ).toContain(">3Qa</text>"); // the tap source bar
+    expect(econ).toContain("Log scale");
+    expect(await (await get(`/economy?project=demo&${RANGE}&scale=log`)).text()).toContain("Linear scale");
+
+    const flows = section(await (await get(`/flows?project=demo&${RANGE}`)).text(), "tutorial");
+    expect(cells(flows, "Step")).toEqual(["Step", "Players", "Drop off", "Avg time", "Skipped"]);
+    expect(cells(flows, "2")).toEqual(["2", "1", "0%", "–", "1"]);
+  });
+
+  it("keeps the 0.3.0 Levels and match numbers", async () => {
+    await seed();
+    await seedMatch();
+    await rollUp(NOW);
+    await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify(PRESETS.puzzle_levels)).run();
+    const levels = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(levels, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
+    expect(cells(levels, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify(PRESETS.match_battle)).run();
+    const matches = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(matches, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s"]);
+    expect(cells(matches, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s"]);
   });
 });

@@ -1,4 +1,4 @@
-import { detect, effectiveProfile, type Profile } from "./profile";
+import { detect, detectFrom, effectiveProfile, type Profile } from "./profile";
 
 // Incremental daily rollups (docs/08-dashboard-v0.2.md section 5). A cron reads the raw rows
 // received since the project's watermark, merges them into device and day state in memory,
@@ -17,7 +17,7 @@ const KEEP_AGED_MS = 2 * DAY;
 const DELETE_CHUNK = 5000;
 /** level_* events are plays of kind level (docs/09-game-profiles.md section 4). */
 const LEVEL_RESULT: Record<string, string> = { level_complete: "win", level_fail: "loss", level_quit: "quit" };
-const RESULT_FIELD: Record<string, string> = { win: "wins", loss: "fails", quit: "quits", draw: "draws", abandon: "abandons" };
+const RESULT_FIELD: Record<string, string> = { win: "wins", loss: "fails", quit: "quits", draw: "draws", abandon: "abandons", prestige: "prestiges" };
 /** level_events names for play_end results, so the level detail page reads both the same way. */
 const RESULT_EVENT: Record<string, string> = { loss: "level_fail", quit: "level_quit" };
 /** A tutorial_complete is this step of the flow "tutorial". */
@@ -27,19 +27,30 @@ const DIM_VALUES = 200;
 const text = (v: unknown) => typeof v === "string" || typeof v === "number" || typeof v === "boolean" ? String(v).slice(0, 40) : "";
 /** Ninja Smash ad events, counted with this ad format. */
 const AD_ALIAS: Record<string, string> = { interstitial_shown: "interstitial", continue_watched: "rewarded" };
-const ECON_NAMES = ["iap_purchase", "try_taken", "try_offer_shown", ...Object.keys(AD_ALIAS)];
+const ECON_NAMES = ["iap_purchase", "try_taken", "try_offer_shown", "offline_reward", ...Object.keys(AD_ALIAS)];
 const isEcon = (name: string) => /^(currency|booster|ad)_/.test(name) || ECON_NAMES.includes(name);
 /** First scalar props value of these keys, at most 40 characters, else "". */
 const detailOf = (props: Record<string, unknown>, keys: string[]) => text(keys.map((k) => props[k]).find((v) => v !== undefined));
 /** The props key that names what an economy event is about: the booster, the ad format, the source or sink. */
 const econKeys = (name: string) => name.startsWith("booster_") ? ["booster"] : name.startsWith("try_") ? ["booster", "mode"] : name.startsWith("ad_") ? ["format"]
-  : name === "iap_purchase" ? ["product"] : name === "currency_spent" ? ["sink"] : ["source", "sink"];
+  : name === "iap_purchase" ? ["product"] : name === "currency_spent" ? ["sink"] : name === "offline_reward" ? ["via"] : ["source", "sink"];
+/** Session gap buckets (docs/10-v0.3.1.md section 2.2), by session_start props.since_last_ms. */
+const GAPS: [number, string][] = [[3_600_000, "<1h"], [4 * 3_600_000, "1-4h"], [12 * 3_600_000, "4-12h"], [DAY, "12-24h"], [Infinity, "24h+"]];
+/** Play events; one without a level counts under this play key. */
+const PLAY_EVENTS = new Set(["level_start", "level_complete", "level_fail", "level_quit", "play_start", "play_end"]);
+export const NO_LEVEL = "(none)";
+/** Props keys of play events that are not dimensions. */
+const NOT_DIMS = new Set(["kind", "result", "reason", "step_id", "attempt"]);
+/** Keys and values the Settings form suggests, kept for this many days, at most SEEN_MAX tracks, keys and flows each. */
+const SEEN_DAYS = 7;
+const SEEN_MAX = 40;
+const dict = <T>(o: Record<string, T> | undefined): Record<string, T> => Object.assign(Object.create(null), o);
 /** The free plan allows 50 D1 queries per invocation; keep a margin. */
 const QUERY_BUDGET = 48;
-/** The most queries one project can take in a run without a rebuild: the raw select, three reads and twelve writes. */
-const WORST_PROJECT = 16;
+/** The most queries one project can take in a run without a rebuild: the raw select, four reads and thirteen writes. */
+const WORST_PROJECT = 18;
 /** Statements in startRebuild's batch. */
-const REBUILD_QUERIES = 12;
+const REBUILD_QUERIES = 13;
 
 /** Local calendar day of an epoch ms time, for a fixed offset in minutes east of UTC. */
 export const dayOf = (ts: number, tzMin: number) => new Date(ts + tzMin * 60_000).toISOString().slice(0, 10);
@@ -47,8 +58,10 @@ export const dayOf = (ts: number, tzMin: number) => new Date(ts + tzMin * 60_000
 export interface Project {
   id: string; tz_min: number; rollup_tz: number; wm_at: number; wm_id: string;
   rebuild_from: number | null; rebuild_until: number | null;
-  profile?: string | null; profile_detected?: string | null; dim_values?: string | null;
+  profile?: string | null; profile_detected?: string | null; dim_values?: string | null; detected_on?: string | null; seen_keys?: string | null;
 }
+/** Recently seen tracks and flows (by last day), and play props keys with up to 21 distinct values, for the Settings form. */
+export interface SeenKeys { t: Record<string, string>; k: Record<string, { d: string; v: string[] }>; f: Record<string, string> }
 interface Raw {
   event_id: string; name: string; device_id: string; session_id: string; client_ts: number; received_at: number;
   app_version: string | null; platform: string | null; country: string | null; level: string | null;
@@ -72,7 +85,7 @@ interface DevDay { version: string; platform: string; country: string; is_new: n
 export async function runCron(db: D1Database, now: number) {
   const hi = now - LAG_MS;
   const { results } = await db.prepare(
-    `SELECT id, tz_min, rollup_tz, wm_at, wm_id, rebuild_from, rebuild_until, profile, profile_detected, dim_values,
+    `SELECT id, tz_min, rollup_tz, wm_at, wm_id, rebuild_from, rebuild_until, profile, profile_detected, dim_values, detected_on, seen_keys,
        tz_min <> rollup_tz OR rebuild_until IS NOT NULL
        OR EXISTS (SELECT 1 FROM events e WHERE e.project_id = p.id AND (e.received_at, e.event_id) > (p.wm_at, p.wm_id) AND e.received_at <= ?1)
        OR EXISTS (SELECT 1 FROM devices d WHERE d.project_id = p.id AND d.open_min < ?2) AS busy
@@ -83,7 +96,12 @@ export async function runCron(db: D1Database, now: number) {
   const cost = { queries: 3 }; // the list above, then the retention delete and cron_at update below
   for (const p of results.filter((r) => r.busy)) {
     if (cost.queries + WORST_PROJECT + (p.tz_min !== p.rollup_tz ? REBUILD_QUERIES : 0) > QUERY_BUDGET) break;
-    await rollupProject(db, p, now, CHUNK, cost);
+    try {
+      await rollupProject(db, p, now, CHUNK, cost);
+    } catch (e) {
+      // One project's bad data must not stall the cron for the others; it goes last in the next run.
+      console.error(`rollup ${p.id}:`, e);
+    }
     done.push(p.id);
   }
   await db.batch([
@@ -100,7 +118,7 @@ export async function runCron(db: D1Database, now: number) {
 export async function rollupProject(db: D1Database, project: Project, now: number, chunk = CHUNK, cost = { queries: 0 }): Promise<number> {
   if (project.tz_min !== project.rollup_tz) cost.queries += REBUILD_QUERIES;
   const p = project.tz_min === project.rollup_tz ? project : await startRebuild(db, project, now);
-  cost.queries += 4; // the raw select and three reads
+  cost.queries += 5; // the raw select and up to four reads
   const tz = p.tz_min;
   const hi = now - LAG_MS;
   const rows = (await db.prepare(
@@ -118,7 +136,11 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
 
   const ids = [...new Set(live.map((r) => r.device_id))];
   const days = live.map((r) => dayOf(r.client_ts, tz)).sort();
-  const [known, agedDevs, knownDays] = await db.batch<Record<string, unknown>>([
+  const today = dayOf(now, tz);
+  const weekAgo = dayOf(now - (SEEN_DAYS - 1) * DAY, tz);
+  // Until a profile is saved, the preset is detected again once a day from the last 7 days of rollups.
+  const redetect = !p.profile && p.detected_on !== today;
+  const [known, agedDevs, knownDays, kindRows] = await db.batch<Record<string, unknown>>([
     db.prepare("SELECT device_id, first_day, version, platform, country, open, tracks FROM devices WHERE project_id = ?1 AND device_id IN (SELECT value FROM json_each(?2))")
       .bind(p.id, JSON.stringify(ids)),
     db.prepare("SELECT device_id, first_day, version, platform, country, open, tracks FROM devices WHERE project_id = ?1 AND open_min < ?2")
@@ -126,6 +148,9 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     db.prepare(`SELECT day, device_id, version, platform, country, is_new, events, seen FROM device_days
       WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND device_id IN (SELECT value FROM json_each(?4))`)
       .bind(p.id, days[0] ?? "", days.at(-1) ?? "", JSON.stringify(ids)),
+    ...(redetect ? [db.prepare(`SELECT kind, SUM(starts + wins + fails + quits + draws + abandons + prestiges) AS n, SUM(prestiges) AS prestiges
+        FROM play_days WHERE project_id = ?1 AND day >= ?2 GROUP BY kind
+      UNION ALL SELECT '', 0, COUNT(*) FROM event_days WHERE project_id = ?1 AND day >= ?2 AND name = 'offline_reward'`).bind(p.id, weekAgo)] : []),
   ]);
 
   const devs = new Map<string, Dev>();
@@ -153,9 +178,21 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   }
 
   const parsed = new Map(live.map((r) => [r, r.props ? JSON.parse(r.props) as Record<string, unknown> : {}]));
-  const detected = p.profile_detected ?? (p.profile ? null : detect(live.map((r) => ({ name: r.name, props: parsed.get(r)! }))));
+  const chunkDetected = () => detect(live.map((r) => ({ name: r.name, props: parsed.get(r)! })));
+  const detected = redetect
+    ? detectFrom(kindRows.results.filter((k) => k.kind).map((k) => ({ kind: k.kind as string, n: k.n as number, prestiges: k.prestiges as number })),
+      kindRows.results.filter((k) => !k.kind).reduce((t, k) => t + (k.prestiges as number), 0), p.profile_detected ?? null) ?? chunkDetected() ?? p.profile_detected ?? null
+    : p.profile_detected ?? (p.profile ? null : chunkDetected());
+  // A different preset changes what the rollups count: rebuild them with it.
+  const redo = redetect && !!p.profile_detected && detected !== p.profile_detected;
+  // Objects without a prototype, so keys such as "constructor" from event props are plain keys.
+  const seenRaw: Partial<SeenKeys> = p.seen_keys ? JSON.parse(p.seen_keys) : {};
+  const seenKeys: SeenKeys = { t: dict(seenRaw.t), k: dict(seenRaw.k), f: dict(seenRaw.f) };
+  const seeKey = (m: Record<string, string>, key: string, day: string) => {
+    if (key && !(m[key] >= day) && (m[key] !== undefined || Object.keys(m).length < SEEN_MAX)) m[key] = day;
+  };
   const profile: Profile | null = effectiveProfile(p.profile, detected);
-  const dimValues: Record<string, string[]> = p.dim_values ? JSON.parse(p.dim_values) : {};
+  const dimValues: Record<string, string[]> = dict(p.dim_values ? JSON.parse(p.dim_values) : {});
   /** A dimension value, or "other" once the dimension has DIM_VALUES values. */
   const capped = (dim: string, value: string) => {
     const known = dimValues[dim] ??= [];
@@ -172,6 +209,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   const cohorts = new Map<string, Record<string, number>>();
   const levelEvents = new Map<string, Record<string, number>>();
   const econ = new Map<string, Record<string, number>>();
+  const gaps = new Map<string, Record<string, number>>();
   const add = (m: Map<string, Record<string, number>>, key: unknown[], field: string, n: number) => {
     const k = JSON.stringify(key);
     const o = m.get(k) ?? {};
@@ -204,16 +242,23 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       const k = [day, r.name, r.currency ?? "", AD_ALIAS[r.name] ?? detailOf(props, econKeys(r.name)), v, pl];
       add(econ, k, "count", 1);
       add(econ, k, "value_sum", r.value ?? 0);
+      if (r.duration_ms !== null) add(econ, k, "duration_sum", r.duration_ms);
     }
-    // Flow steps; tutorial_* events are the flow "tutorial".
+    const gap = r.name === "session_start" ? props.since_last_ms : undefined;
+    if (typeof gap === "number" && gap >= 0) add(gaps, [day, GAPS.find(([max]) => gap < max)![1], v, pl], "sessions", 1);
+    // Flow steps; tutorial_* events are the flow "tutorial", and tutorial_skip a skip at its step.
     const [flow, step] = r.name === "step" ? [text(props.flow), Number(props.step)] : r.name === "tutorial_begin" ? ["tutorial", 0]
-      : r.name === "tutorial_step" ? ["tutorial", Number(props.step)] : r.name === "tutorial_complete" ? ["tutorial", STEP_DONE] : ["", NaN] as [string, number];
+      : r.name === "tutorial_step" || r.name === "tutorial_skip" ? ["tutorial", Number(props.step ?? 0)] : r.name === "tutorial_complete" ? ["tutorial", STEP_DONE]
+      : ["", NaN] as [string, number];
     if (flow && Number.isInteger(step) && step >= 0 && step <= STEP_DONE) {
       const sk = [day, flow, step, v, pl];
       const seenStep = JSON.stringify([flow, step]);
       if (!(dd.seen.f ??= []).includes(seenStep)) { dd.seen.f.push(seenStep); add(steps, sk, "devices", 1); }
-      if (r.duration_ms !== null) { add(steps, sk, "duration_sum", r.duration_ms); add(steps, sk, "duration_n", 1); }
+      if (r.name === "tutorial_skip") add(steps, sk, "skips", 1);
+      else if (r.duration_ms !== null) { add(steps, sk, "duration_sum", r.duration_ms); add(steps, sk, "duration_n", 1); }
+      seeKey(seenKeys.f, flow, day);
     }
+    if (r.name === "progress") seeKey(seenKeys.t, text(props.track), day);
     // Progression tracks declared with milestones.
     const track = r.name === "progress" ? profile?.tracks.find((t) => t.key === props.track && t.milestones.length) : undefined;
     const x = r.value ?? Number(props.value);
@@ -237,25 +282,38 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       }
     }
 
-    if (r.level === null) continue;
+    const isPlay = PLAY_EVENTS.has(r.name);
+    if (r.level === null && !isPlay) continue;
+    for (const [key, val] of isPlay ? Object.entries(props) : []) {
+      if (NOT_DIMS.has(key) || !text(val) || Object.keys(seenKeys.k).length >= SEEN_MAX && !seenKeys.k[key]) continue;
+      const e = seenKeys.k[key] = seenKeys.k[key]?.d >= weekAgo ? seenKeys.k[key] : { d: day, v: [] };
+      if (day > e.d) e.d = day;
+      for (const part of typeof val === "string" ? val.split(",").slice(0, 10) : [val]) {
+        const t = text(typeof part === "string" ? part.trim() : part);
+        if (t && e.v.length <= 20 && !e.v.includes(t)) e.v.push(t);
+      }
+    }
+    const level = r.level ?? NO_LEVEL;
     const isStart = r.name === "level_start" || r.name === "play_start";
     const isEnd = r.name === "play_end" || Object.hasOwn(LEVEL_RESULT, r.name);
     const result = r.name === "play_end" ? text(props.result) : (Object.hasOwn(LEVEL_RESULT, r.name) ? LEVEL_RESULT[r.name] : "");
     if (!isStart && result !== "win") {
       const name = r.name === "play_end" ? (Object.hasOwn(RESULT_EVENT, result) ? RESULT_EVENT[result] : `play_${result || "end"}`) : r.name;
-      add(levelEvents, [day, r.level, name, detailOf(props, ["reason", "via", "booster"]), v, pl], "count", 1);
+      add(levelEvents, [day, level, name, detailOf(props, ["reason", "via", "booster"]), v, pl], "count", 1);
     }
     if (!isStart && !isEnd) continue;
     const kind = text(props.kind) || (r.name.startsWith("level_") ? "level" : "play");
     const mode = text(props.mode) && capped("mode", text(props.mode)), difficulty = text(props.difficulty) && capped("difficulty", text(props.difficulty));
-    const lk = [day, kind, r.level, mode, difficulty, v, pl];
+    const lk = [day, kind, level, mode, difficulty, v, pl];
     // By attempt, not session, so a play resumed after a restart still closes; session only when attempt is missing.
-    const ok = JSON.stringify([r.level, r.attempt ?? "s:" + r.session_id]);
+    const ok = JSON.stringify([level, r.attempt ?? "s:" + r.session_id]);
     if (isStart) {
       add(levels, lk, "starts", 1);
       if (r.attempt === 1) add(levels, lk, "first_starts", 1);
-      if (!dd.seen.l.includes(r.level)) { dd.seen.l.push(r.level); add(levels, lk, "players", 1); }
-      dev.open[ok] = { r: r.received_at, d: day, v, p: pl, l: r.level, k: kind, m: mode, f: difficulty };
+      // Players per kind: seen.l holds "kind\u001flevel". A bare level is from before 0.3.1, of any kind.
+      const pk = `${kind}\u001f${level}`;
+      if (!dd.seen.l.includes(pk) && !dd.seen.l.includes(level)) { dd.seen.l.push(pk); add(levels, lk, "players", 1); }
+      dev.open[ok] = { r: r.received_at, d: day, v, p: pl, l: level, k: kind, m: mode, f: difficulty };
       dev.dirty = true;
       continue;
     }
@@ -285,7 +343,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     };
     dimRow("", "");
     for (const d of profile.dimensions) {
-      const raw = d.key === "level" && props.level === undefined ? r.level : props[d.key];
+      const raw = d.key === "level" && props.level === undefined ? level : props[d.key];
       const values = d.multi && typeof raw === "string" ? [...new Set(raw.split(",").map((s) => text(s.trim())).filter(Boolean))].slice(0, 10)
         : text(raw) ? [text(raw)] : [];
       for (const val of values) dimRow(d.key, capped(d.key, val));
@@ -312,10 +370,11 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   });
   const flat = (m: Map<string, Record<string, number>>, fields: string[]) =>
     [...m].map(([k, o]) => [...JSON.parse(k), ...fields.map((f) => o[f] ?? 0)]);
-  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "draws", "abandons", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts"];
+  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "draws", "abandons", "prestiges", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts"];
   const DIM_FIELDS = ["plays", "players", "wins", "losses", "draws", "score_sum", "score_n"];
   const TRACK_FIELDS = ["devices", "reached", "reach_days"];
-  const STEP_FIELDS = ["devices", "duration_sum", "duration_n"];
+  const STEP_FIELDS = ["devices", "duration_sum", "duration_n", "skips"];
+  const ECON_FIELDS = ["count", "value_sum", "duration_sum"];
   const EVENT_FIELDS = ["count", "devices", "value_sum"];
 
   const col = (n: number) => Array.from({ length: n }, (_, i) => `json_extract(value, '$[${i}]')`).join(", ");
@@ -360,15 +419,20 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       SELECT ?1, ${col(7)} FROM json_each(?2) WHERE true
       ON CONFLICT (project_id, day, level, name, detail, version, platform) DO UPDATE SET ${sum("level_events", ["count"])}`,
       flat(levelEvents, ["count"])),
-    ...upsert(`INSERT INTO econ_days (project_id, day, name, currency, detail, version, platform, count, value_sum)
-      SELECT ?1, ${col(8)} FROM json_each(?2) WHERE true
-      ON CONFLICT (project_id, day, name, currency, detail, version, platform) DO UPDATE SET ${sum("econ_days", ["count", "value_sum"])}`,
-      flat(econ, ["count", "value_sum"])),
+    ...upsert(`INSERT INTO econ_days (project_id, day, name, currency, detail, version, platform, ${ECON_FIELDS.join(", ")})
+      SELECT ?1, ${col(6 + ECON_FIELDS.length)} FROM json_each(?2) WHERE true
+      ON CONFLICT (project_id, day, name, currency, detail, version, platform) DO UPDATE SET ${sum("econ_days", ECON_FIELDS)}`,
+      flat(econ, ECON_FIELDS)),
+    ...upsert(`INSERT INTO gap_days (project_id, day, bucket, version, platform, sessions)
+      SELECT ?1, ${col(5)} FROM json_each(?2) WHERE true
+      ON CONFLICT (project_id, day, bucket, version, platform) DO UPDATE SET ${sum("gap_days", ["sessions"])}`,
+      flat(gaps, ["sessions"])),
     db.prepare(`UPDATE projects SET wm_at = ?2, wm_id = ?3,
         rebuild_from = CASE WHEN ?4 THEN NULL ELSE rebuild_from END, rebuild_until = CASE WHEN ?4 THEN NULL ELSE rebuild_until END,
-        profile_detected = ?5, dim_values = ?6
+        profile_detected = ?5, dim_values = ?6, detected_on = ?7, seen_keys = ?8, rollup_tz = CASE WHEN ?9 THEN tz_min + 100000 ELSE rollup_tz END
       WHERE id = ?1`).bind(p.id, last?.received_at ?? p.wm_at, last?.event_id ?? p.wm_id, endRebuild ? 1 : 0, detected,
-        Object.keys(dimValues).length ? JSON.stringify(dimValues) : null),
+        Object.keys(dimValues).length ? JSON.stringify(dimValues) : null, redetect ? today : p.detected_on ?? null,
+        JSON.stringify(pruneSeen(seenKeys, weekAgo)), redo ? 1 : 0),
     // Raw retention: only rows already rolled up, at most DELETE_CHUNK per run.
     db.prepare(`DELETE FROM events WHERE project_id = ?1 AND event_id IN
       (SELECT event_id FROM events WHERE project_id = ?1 AND received_at < ?2 LIMIT ${DELETE_CHUNK})`).bind(p.id, retentionCutoff),
@@ -376,6 +440,12 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   cost.queries += writes.length;
   await db.batch(writes);
   return rows.length;
+}
+
+/** Drops keys not seen since day, so the Settings form suggests only the last 7 days. */
+function pruneSeen(s: SeenKeys, day: string): SeenKeys {
+  const keep = <T>(m: Record<string, T>, d: (v: T) => string) => Object.fromEntries(Object.entries(m).filter(([, v]) => d(v) >= day));
+  return { t: keep(s.t, (d) => d), k: keep(s.k, (e) => e.d), f: keep(s.f, (d) => d) };
 }
 
 /**
@@ -396,7 +466,7 @@ async function startRebuild(db: D1Database, p: Project, now: number): Promise<Pr
     wm_id: p.wm_at <= from - DAY ? p.wm_id : "",
   };
   await db.batch([
-    ...["device_days", "play_days", "event_days", "cohort_days", "level_events", "econ_days", "dim_days", "track_days", "step_days"].map((t) =>
+    ...["device_days", "play_days", "event_days", "cohort_days", "level_events", "econ_days", "dim_days", "track_days", "step_days", "gap_days"].map((t) =>
       db.prepare(`DELETE FROM ${t} WHERE project_id = ? AND day >= ?`).bind(p.id, day)),
     db.prepare("DELETE FROM devices WHERE project_id = ? AND first_day >= ?").bind(p.id, day),
     // Milestones reached in the replay window are counted again; earlier ones stay reached.

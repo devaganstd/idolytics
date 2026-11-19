@@ -4,11 +4,11 @@ import { newWriteKey, safeEqual, sha256Hex } from "./keys";
 import { effectiveProfile, parseProfile, plural, PRESETS, type Profile } from "./profile";
 import {
   cohortTable, contentPage, devicePage, type DimRow, economy, eventsPage, type Filters, flowsPage, type Kpis, levelDetail, type LevelRow, levelTable,
-  live, LIVE_MS, overview, parseFilters, progressPage, RANGES, RAW_MAX_DAYS, type Results, type StepRow, suggestDims, type TailRow, type TrackRow,
+  live, LIVE_MS, overview, parseFilters, progressPage, RANGES, RAW_MAX_DAYS, type Results, seenKeys, type StepRow, type TailRow, type TrackRow,
   usageToday,
 } from "./queries";
-import { dayOf, QUIT_AFTER_MS, STEP_DONE } from "./rollup";
-import { barList, dayBars } from "./svg";
+import { DAY, dayOf, QUIT_AFTER_MS, STEP_DONE } from "./rollup";
+import { barList, big, dayBars } from "./svg";
 
 const HEADERS = {
   "Content-Type": "text/html; charset=utf-8",
@@ -88,8 +88,26 @@ export async function setTimezone(request: Request, env: Env): Promise<Response>
   return new Response(null, { status: 303, headers: { Location: /^\/(?![/\\])[^\x00-\x1f]*$/.test(back) ? back : "/" } });
 }
 
+/** The profile the Settings form posts (form=1), before parseProfile validates it. Row numbers come from checked boxes. */
+function fromForm(form: FormData) {
+  const g = (k: string) => String(form.get(k) ?? "").trim();
+  const rows = (k: string) => form.getAll(k).map(String).filter((i) => /^\d{1,2}$/.test(i)).slice(0, 50);
+  const label = (k: string) => (g(k) ? { label: g(k) } : {});
+  const nums = (v: string) => v.split(",").map((x) => x.trim()).filter(Boolean).map((x) => {
+    const n = Number(x);
+    if (!Number.isFinite(n)) throw new Error(`milestone ${x.slice(0, 20)} is not a number`);
+    return n;
+  });
+  return {
+    preset: g("preset"), play_label: g("play_label"), play_kinds: g("play_kinds").split(",").map((k) => k.trim()).filter(Boolean),
+    tracks: rows("t_on").map((i) => ({ key: g(`t_key_${i}`), ...label(`t_label_${i}`), milestones: nums(g(`t_ms_${i}`)), scale: g(`t_scale_${i}`) || undefined })),
+    dimensions: rows("d_on").map((i) => ({ key: g(`d_key_${i}`), ...label(`d_label_${i}`), ...(form.get(`d_multi_${i}`) ? { multi: true } : {}) })),
+    flows: form.getAll("flow").map(String).slice(0, 50),
+  };
+}
+
 /**
- * POST /settings/profile: saves a project's game profile, from a preset or as JSON. The cron then rebuilds the
+ * POST /settings/profile: saves a project's game profile, from the form, a preset or JSON. The cron then rebuilds the
  * last 90 days with it, for the project and its test sibling.
  */
 export async function setProfile(request: Request, env: Env): Promise<Response> {
@@ -99,7 +117,8 @@ export async function setProfile(request: Request, env: Env): Promise<Response> 
   const preset = String(form.get("preset") ?? ""), json = String(form.get("profile") ?? "").trim();
   let profile: Profile;
   try {
-    if (preset) profile = Object.hasOwn(PRESETS, preset) ? PRESETS[preset] : parseProfile(null);
+    if (form.get("form")) profile = parseProfile(fromForm(form));
+    else if (preset) profile = Object.hasOwn(PRESETS, preset) ? PRESETS[preset] : parseProfile(null);
     else if (json.length > 4000) throw new Error("at most 4000 characters");
     else profile = parseProfile(JSON.parse(json));
   } catch (e) {
@@ -154,7 +173,7 @@ const RAW_PAGES = new Set(["/levels", "/events", "/device"]);
 export const isPage = (path: string) => path in PAGES || DETAIL.has(path);
 
 const compact = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
-const num = (v: number | null) => (v === null ? "–" : compact.format(v));
+const num = (v: number | null) => (v === null ? "–" : Math.abs(v) >= 1e15 ? big(v) : compact.format(v));
 const pct = (v: number | null) => (v === null ? "–" : `${Math.round(v * 100)}%`);
 const dur = (ms: number | null) => {
   if (ms === null) return "–";
@@ -227,9 +246,12 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   let body: string, rowsRead: number, options = { versions: [] as string[], countries: [] as string[], platforms: ["android", "ios", "webgl", "editor"] };
   if (url.pathname === "/settings") {
     const u = await usageToday(env.DB, new Date(now).toISOString().slice(0, 10), all.map((p) => p.id));
-    const sug = await suggestDims(env.DB, current.id, now);
-    rowsRead = u.rowsRead + sug.rowsRead;
-    body = settingsBody(all, rows, current, u, dailyCap(env), tzForm) + profileBody(current, profile, sug.keys);
+    const seen = await seenKeys(env.DB, current.id, dayOf(now - 6 * DAY, tz));
+    rowsRead = u.rowsRead + seen.rowsRead;
+    const asked = url.searchParams.get("preset") ?? "";
+    const shown = Object.hasOwn(PRESETS, asked) ? PRESETS[asked] : profile ?? PRESETS.puzzle_levels;
+    body = settingsBody(all, rows, current, u, dailyCap(env), tzForm)
+      + profileBody(current, current.profile ? profile : null, shown, seen, current.tz_min !== current.rollup_tz || current.rebuild_until !== null);
   } else if (!data) {
     rowsRead = 0;
     body = `<section><p class="empty">No test key yet. Create one in <a href="${esc(link({ env: null }, "/settings"))}">Settings</a>; its events show here.</p></section>`;
@@ -240,7 +262,8 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   } else if (url.pathname === "/economy") {
     const r = await economy(env.DB, pid, f);
     rowsRead = r.rowsRead;
-    body = economyBody(r, dayHref);
+    const log = url.searchParams.get("scale") === "log";
+    body = economyBody(r, dayHref, log, link({ scale: log ? null : "log" }));
   } else if (url.pathname === "/retention") {
     const r = await cohortTable(env.DB, pid, f, today);
     rowsRead = r.rowsRead;
@@ -345,6 +368,7 @@ function filterBar(f: Filters, path: string, project: string, testEnv: boolean, 
 }
 
 type Overview = Awaited<ReturnType<typeof overview>>;
+const GAP_LABELS: [string, string][] = [["<1h", "Under 1 h"], ["1-4h", "1 to 4 h"], ["4-12h", "4 to 12 h"], ["12-24h", "12 to 24 h"], ["24h+", "Over 24 h"]];
 
 function overviewBody(o: Overview, f: Filters, dayHref: (d: string) => string, levelsHref: string) {
   const period = f.days === 1 ? "previous day" : `previous ${f.days} days`;
@@ -381,6 +405,10 @@ function overviewBody(o: Overview, f: Filters, dayHref: (d: string) => string, l
     <p class="legend"><span class="key s1"></span>New <span class="key s2"></span>Returning <span class="key s3 line"></span>Sessions</p></section>
   <section><h2>Top events</h2><p class="note">Event count in the range.${f.c || f.who !== "all" ? " Not filtered by country or new or returning players." : ""}</p>
     ${barList(o.topEvents.map((e) => ({ label: e.name, value: e.count })))}</section>
+  <section><h2>Session rhythm</h2><p class="note">${o.sessionsPerPlayerDay === null ? "No sessions in this range." : `${o.sessionsPerPlayerDay.toFixed(1)} sessions per player per day.`}
+    Sessions by the time since the device's previous session (session_start since_last_ms, SDK 0.2.1). Not filtered by country or new or returning players.</p>
+    ${o.gaps.size ? barList(GAP_LABELS.map(([k, label]) => ({ label, value: o.gaps.get(k) ?? 0 })))
+      : `<p class="empty">No session gaps yet. They need since_last_ms on session_start.</p>`}</section>
   ${levels}`;
 }
 
@@ -410,6 +438,7 @@ const LEVEL_COLS: Col[] = [
   { key: "quits", label: "Quits (inferred)", value: (l) => l.quits },
   { key: "draws", label: "Draws", value: (l) => l.draws },
   { key: "abandons", label: "Abandons", value: (l) => l.abandons },
+  { key: "prestiges", label: "Prestiges", value: (l) => l.prestiges },
   { key: "win", label: "Win rate", value: (l) => ratio(l.wins, l.wins + l.fails), show: (l) => pct(ratio(l.wins, l.wins + l.fails)) },
   { key: "first", label: "First try win rate", value: (l) => ratio(l.first_try_wins, l.first_starts), show: (l) => pct(ratio(l.first_try_wins, l.first_starts)) },
   { key: "apw", label: "Attempts per win", value: (l) => ratio(l.starts, l.wins), show: (l) => (l.wins && l.starts ? (l.starts / l.wins).toFixed(1) : "–") },
@@ -419,9 +448,9 @@ const LEVEL_COLS: Col[] = [
 ];
 const byLevel = (a: LevelRow, b: LevelRow) => Number(a.level) - Number(b.level) || a.level.localeCompare(b.level, "en", { numeric: true });
 
-/** Columns with data: draws, abandons, stars and moves left only when some play has them. Fails are losses outside levels. */
+/** Columns with data: draws, abandons, prestiges, stars and moves left only when some play has them. Fails are losses outside levels. */
 const levelCols = (levels: LevelRow[], label: string) => LEVEL_COLS.filter((c) =>
-  !["draws", "abandons", "stars", "moves"].includes(c.key) || levels.some((l) =>
+  !["draws", "abandons", "prestiges", "stars", "moves"].includes(c.key) || levels.some((l) =>
     (c.key === "stars" ? l.stars_n : c.key === "moves" ? l.moves_left_n : c.value(l)) as number > 0))
   .map((c) => (c.key === "fails" && label !== "Level" ? { ...c, label: "Losses" } : c));
 
@@ -488,11 +517,12 @@ function progressBody(profile: Profile | null, rows: TrackRow[]) {
   return tracks.map((t) => {
     const get = (b: string) => rows.find((r) => r.track === t.key && r.bucket === b) ?? { devices: 0, reached: 0, reach_days: 0 };
     const ms = t.milestones;
+    const show = (m: number) => (t.scale === "log10" ? big(m) : String(m));
     const below = get(`<${ms[0]}`);
-    const lines = [`<tr><td>Below ${ms[0]}</td><td>${below.devices}</td><td>–</td><td>–</td><td>–</td></tr>`, ...ms.map((m, i) => {
+    const lines = [`<tr><td>Below ${show(ms[0])}</td><td>${below.devices}</td><td>–</td><td>–</td><td>–</td></tr>`, ...ms.map((m, i) => {
       const r = get(String(m));
       const stopped = Math.max(0, r.reached - (i + 1 < ms.length ? get(String(ms[i + 1])).reached : 0));
-      return `<tr><td>${m}+</td><td>${r.devices}</td><td>${r.reached}</td><td>${r.reached ? (r.reach_days / r.reached).toFixed(1) : "–"}</td><td>${stopped}</td></tr>`;
+      return `<tr><td>${show(m)}+</td><td>${r.devices}</td><td>${r.reached}</td><td>${r.reached ? (r.reach_days / r.reached).toFixed(1) : "–"}</td><td>${stopped}</td></tr>`;
     })];
     return `<section><h2>${esc(t.label ?? t.key)}</h2>
       <p class="note">Player days counts each device once a day, at its highest ${esc(t.key)} that day. Reached counts devices that first got to a
@@ -508,22 +538,64 @@ function flowsBody(rows: StepRow[]) {
   const label = (flow: string, step: number) => (step === STEP_DONE ? "Complete" : flow === "tutorial" && step === 0 ? "Begin" : String(step));
   return flows.map((flow) => {
     const steps = rows.filter((r) => r.flow === flow);
+    const skips = steps.some((r) => r.skips > 0);
     const lines = steps.map((r, i) => `<tr><td>${label(flow, r.step)}</td><td>${r.devices}</td>
-      <td>${i ? pct(1 - (ratio(r.devices, steps[i - 1].devices) ?? 1)) : "–"}</td><td>${dur(ratio(r.duration_sum, r.duration_n))}</td></tr>`).join("");
-    return `<section><h2>${esc(flow)}</h2><p class="note">Players are distinct devices per day that reached the step, summed. Drop off is against the previous step.</p>
-      <div class="scroll"><table><thead><tr><th>Step</th><th>Players</th><th>Drop off</th><th>Avg time</th></tr></thead><tbody>${lines}</tbody></table></div></section>`;
+      <td>${i ? pct(1 - (ratio(r.devices, steps[i - 1].devices) ?? 1)) : "–"}</td><td>${dur(ratio(r.duration_sum, r.duration_n))}</td>${skips ? `<td>${r.skips}</td>` : ""}</tr>`).join("");
+    return `<section><h2>${esc(flow)}</h2><p class="note">Players are distinct devices per day that reached the step, summed. Drop off is against the previous step.${
+      skips ? " Skipped counts tutorial_skip at the step." : ""}</p>
+      <div class="scroll"><table><thead><tr><th>Step</th><th>Players</th><th>Drop off</th><th>Avg time</th>${skips ? "<th>Skipped</th>" : ""}</tr></thead><tbody>${lines}</tbody></table></div></section>`;
   }).join("");
 }
 
-function profileBody(current: Proj, profile: Profile | null, suggested: string[]) {
+/** Milestones as typed in the form: 1e6 rather than 1000000. */
+const milestone = (m: number) => (Math.abs(m) >= 1e6 ? m.toExponential().replace("e+", "e") : String(m));
+
+/**
+ * The game profile form (docs/10-v0.3.1.md section 1): shown is the profile it starts from (a preset picked above it,
+ * else the saved or detected one). Rows add what the rollup saw in the last 7 days; checked rows are saved.
+ */
+function profileBody(current: Proj, saved: Profile | null, shown: Profile, seen: Awaited<ReturnType<typeof seenKeys>>, rebuilding: boolean) {
+  const id = esc(current.id);
+  const has = <T extends { key: string }>(list: T[], key: string) => list.some((x) => x.key === key);
+  const tracks = [...shown.tracks.map((t) => ({ t, on: true })),
+    ...seen.tracks.filter((k) => !has(shown.tracks, k)).map((key) => ({ t: { key, milestones: [] as number[] } as Profile["tracks"][number], on: false })),
+    { t: { key: "", milestones: [] as number[] } as Profile["tracks"][number], on: false }];
+  const trackRows = tracks.map(({ t, on }, i) => `<tr><td><input type="checkbox" name="t_on" value="${i}"${on ? " checked" : ""} aria-label="Count this track"></td>
+    <td><input name="t_key_${i}" value="${esc(t.key)}" maxlength="40" placeholder="props.track"></td>
+    <td><input name="t_label_${i}" value="${esc(t.label ?? "")}" maxlength="40" placeholder="${esc(t.key || "Label")}"></td>
+    <td><input name="t_ms_${i}" value="${esc(t.milestones.map(milestone).join(", "))}" placeholder="100, 500, 1e6"></td>
+    <td><select name="t_scale_${i}"><option value="linear"${t.scale === "log10" ? "" : " selected"}>linear</option><option value="log10"${t.scale === "log10" ? " selected" : ""}>log10</option></select></td></tr>`).join("");
+  const counts = new Map(seen.keys.map((k) => [k.key, k.values]));
+  const dims = [...shown.dimensions.map((d) => ({ d, on: true })), ...(has(shown.dimensions, "level") ? [] : [{ d: { key: "level" }, on: false }]),
+    ...seen.keys.filter((k) => !has(shown.dimensions, k.key) && k.key !== "level").map((k) => ({ d: { key: k.key }, on: false }))] as { d: Profile["dimensions"][number]; on: boolean }[];
+  const count = (key: string) => key === "level" ? "the play key" : counts.has(key) ? `${counts.get(key)! > 20 ? "20+" : counts.get(key)} value${counts.get(key) === 1 ? "" : "s"}` : "";
+  const dimRows = dims.map(({ d, on }, i) => `<tr><td><input type="checkbox" name="d_on" value="${i}"${on ? " checked" : ""} aria-label="Count this dimension"></td>
+    <td><input type="hidden" name="d_key_${i}" value="${esc(d.key)}"><code>${esc(d.key)}</code></td>
+    <td><input name="d_label_${i}" value="${esc(d.label ?? "")}" maxlength="40" placeholder="${esc(d.key)}"></td>
+    <td><input type="checkbox" name="d_multi_${i}" value="1"${d.multi ? " checked" : ""} aria-label="Several comma-separated values"></td><td>${count(d.key)}</td></tr>`).join("");
+  const flows = [...shown.flows, ...seen.flows.filter((f) => !shown.flows.includes(f))];
+  const presetLabel = (k: string) => `${k}${k === current.profile_detected ? " (Detected)" : ""}`;
   return `<section><h2>Game profile</h2>
-    <p>${current.profile ? `Saved: ${esc(JSON.parse(current.profile).preset)}` : "Not saved."}${current.profile_detected ? ` Detected: ${esc(current.profile_detected)}.` : ""}</p>
-    ${suggested.length ? `<p class="note">Suggested dimensions: ${esc(suggested.join(", "))}.</p>` : ""}
-    <p class="note">The profile names the plays, and declares the tracks, dimensions and flows the rollups count. Saving it rebuilds the last 90 days.</p>
-    <form method="post" action="/settings/profile" class="profile"><input type="hidden" name="project" value="${esc(current.id)}">
-      <label>Preset <select name="preset"><option value="">Use the JSON below</option>${Object.keys(PRESETS).map((k) => `<option value="${k}">${k}</option>`).join("")}</select></label>
-      <label>Profile JSON <textarea name="profile" rows="8" maxlength="4000">${esc(profile ? JSON.stringify(profile, null, 1) : "")}</textarea></label>
-      <button>Save profile</button></form></section>`;
+    <p>${saved && current.profile ? `Saved: ${esc(JSON.parse(current.profile).preset)}.` : "Not saved."}${current.profile_detected ? ` Detected: ${esc(current.profile_detected)}.` : ""}</p>
+    ${rebuilding ? `<p class="banner">Rebuilding the last 90 days with the saved profile. Numbers settle within a few cron runs.</p>` : ""}
+    <p class="note">The profile names the plays, and declares the tracks, dimensions and flows the rollups count. Rows from the last 7 days of events are added unchecked. Saving rebuilds the last 90 days.</p>
+    <form method="get" action="/settings" class="tz"><input type="hidden" name="project" value="${id}">
+      <label>Preset <select name="preset">${Object.keys(PRESETS).map((k) => `<option value="${k}"${k === shown.preset ? " selected" : ""}>${presetLabel(k)}</option>`).join("")}</select></label>
+      <button>Fill the form</button></form>
+    <form method="post" action="/settings/profile" class="profile"><input type="hidden" name="project" value="${id}"><input type="hidden" name="form" value="1">
+      <input type="hidden" name="preset" value="${esc(shown.preset)}">
+      <div class="pair"><label>Play label <input name="play_label" value="${esc(shown.play_label)}" maxlength="20" required></label>
+      <label>Play kinds <input name="play_kinds" value="${esc(shown.play_kinds.join(", "))}" placeholder="level, match, run"></label></div>
+      <h3>Tracks</h3><div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Milestones</th><th>Scale</th></tr></thead><tbody>${trackRows}</tbody></table></div>
+      <h3>Dimensions</h3><p class="note">Props keys of play events; at most 12 checked. Multi splits a comma-separated value, such as a deck.</p>
+      <div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Multi</th><th>Seen</th></tr></thead><tbody>${dimRows}</tbody></table></div>
+      <h3>Flows</h3>${flows.length ? `<p class="checks">${flows.map((f) => `<label class="check"><input type="checkbox" name="flow" value="${esc(f)}"${shown.flows.includes(f) ? " checked" : ""}> ${esc(f)}</label>`).join("")}</p>`
+        : `<p class="note">No step flows seen in the last 7 days.</p>`}
+      <button>Save profile</button></form>
+    <details><summary>Advanced</summary>
+      <form method="post" action="/settings/profile" class="json"><input type="hidden" name="project" value="${id}">
+      <label>Profile JSON <textarea name="profile" rows="8" maxlength="4000">${esc(JSON.stringify(saved ?? shown, null, 1))}</textarea></label>
+      <button>Save JSON</button></form></details></section>`;
 }
 
 type Counts = { key: string; starts: number; wins: number; fails: number; quits: number };
@@ -585,14 +657,14 @@ function deviceBody(id: string, r: Awaited<ReturnType<typeof devicePage>>, zone:
 const money = (v: number) => (v ? v.toFixed(2) : "–");
 const SERIES = ["s1", "s2", "s3"];
 
-function economyBody(r: Awaited<ReturnType<typeof economy>>, dayHref: (d: string) => string) {
+function economyBody(r: Awaited<ReturnType<typeof economy>>, dayHref: (d: string) => string, log: boolean, scaleHref: string) {
   const sections: string[] = [];
   if (r.currencies.length) {
     sections.push(`<section><h2>Currency</h2><p class="note">Amounts are the value of currency_earned and currency_spent events, by props.source and props.sink.</p>
       <div class="scroll"><table><thead><tr><th>Currency</th><th>Earned</th><th>Spent</th></tr></thead><tbody>${r.currencies.map((c) =>
         `<tr><td>${esc(c.currency || "(not set)")}</td><td>${num(c.earned)}</td><td>${num(c.spent)}</td></tr>`).join("")}</tbody></table></div>
       ${r.currencies.slice(0, 3).map((c) => `<h3>${esc(c.currency || "(not set)")} per day</h3>
-        ${dayBars(r.days, [{ name: "Earned", cls: "s1", values: c.earnedByDay }, { name: "Spent", cls: "s2", values: c.spentByDay }], null, dayHref)}
+        ${dayBars(r.days, [{ name: "Earned", cls: "s1", values: c.earnedByDay }, { name: "Spent", cls: "s2", values: c.spentByDay }], null, dayHref, log)}
         <p class="legend"><span class="key s1"></span>Earned <span class="key s2"></span>Spent</p>
         <div class="pair"><div><h3>Top sources</h3>${barList(c.sources)}</div><div><h3>Top sinks</h3>${barList(c.sinks)}</div></div>`).join("")}</section>`);
   }
@@ -604,10 +676,16 @@ function economyBody(r: Awaited<ReturnType<typeof economy>>, dayHref: (d: string
   if (r.ads.length) {
     const shown = r.ads.slice(0, 3);
     sections.push(`<section><h2>Ads</h2><p class="note">ad_shown by props.format; interstitial_shown counts as interstitial and continue_watched as rewarded. Revenue is the value sent with the ad.</p>
-      ${dayBars(r.days, shown.map((a, i) => ({ name: a.format || "(not set)", cls: SERIES[i], values: a.byDay })), null, dayHref)}
+      ${dayBars(r.days, shown.map((a, i) => ({ name: a.format || "(not set)", cls: SERIES[i], values: a.byDay })), null, dayHref, log)}
       <p class="legend">${shown.map((a, i) => `<span class="key ${SERIES[i]}"></span>${esc(a.format || "(not set)")}`).join(" ")}</p>
       <div class="scroll"><table><thead><tr><th>Format</th><th>Shown</th><th>Revenue</th></tr></thead><tbody>${r.ads.map((a) =>
         `<tr><td>${esc(a.format || "(not set)")}</td><td>${a.shown}</td><td>${money(a.revenue)}</td></tr>`).join("")}</tbody></table></div></section>`);
+  }
+  if (r.offline.length) {
+    sections.push(`<section><h2>Offline rewards</h2><p class="note">offline_reward events per currency. Share of earned is their value / (their value + currency_earned value).
+      Avg time offline is their duration_ms; with an ad counts props.via ad.</p>
+      <div class="scroll"><table><thead><tr><th>Currency</th><th>Rewards</th><th>Value</th><th>Share of earned</th><th>Avg time offline</th><th>With an ad</th></tr></thead><tbody>${r.offline.map((o) =>
+        `<tr><td>${esc(o.currency || "(not set)")}</td><td>${o.rewards}</td><td>${num(o.value)}</td><td>${pct(o.share)}</td><td>${dur(o.avgMs)}</td><td>${pct(o.adShare)}</td></tr>`).join("")}</tbody></table></div></section>`);
   }
   if (r.revenue.length) {
     sections.push(`<section><h2>Revenue</h2><p class="note">Revenue is the value of ad_shown and iap_purchase events, per currency.
@@ -615,6 +693,7 @@ function economyBody(r: Awaited<ReturnType<typeof economy>>, dayHref: (d: string
       <div class="scroll"><table><thead><tr><th>Currency</th><th>Revenue</th><th>Ads</th><th>In-app</th><th>ARPDAU</th></tr></thead><tbody>${r.revenue.map((m) =>
         `<tr><td>${esc(m.currency || "(not set)")}</td><td>${money(m.total)}</td><td>${money(m.ads)}</td><td>${money(m.iap)}</td><td>${m.arpdau === null ? "–" : m.arpdau.toFixed(2)}</td></tr>`).join("")}</tbody></table></div></section>`);
   }
+  if (sections.length) sections.unshift(`<p class="note"><a href="${esc(scaleHref)}">${log ? "Linear scale" : "Log scale"}</a> for the charts.</p>`);
   return sections.join("") || `<section><p class="empty">No economy or ad events in this range.</p>
     <p class="note">Send currency_earned, currency_spent, booster_used, ad_shown or iap_purchase events; see the event schema.</p></section>`;
 }
@@ -685,7 +764,9 @@ details{flex-basis:100%}summary{cursor:pointer;color:var(--muted);padding:4px 0}
 form{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin-top:8px}
 form.tz{margin:0}
 label{display:flex;flex-direction:column;font-size:13px;color:var(--muted)}
-form.profile{flex-direction:column;align-items:stretch}textarea{font:13px/1.4 ui-monospace,monospace}
+form.profile,form.json{flex-direction:column;align-items:stretch}textarea{font:13px/1.4 ui-monospace,monospace}
+table.form td{text-align:left}table.form input:not([type=checkbox]){min-width:96px;width:100%}input[type=checkbox]{min-height:auto;width:20px;height:20px}
+.checks{display:flex;flex-wrap:wrap;gap:8px 16px}label.check{flex-direction:row;gap:6px;align-items:center;font-size:14px;color:var(--text)}
 nav.sub a{padding:4px 10px}
 input,select,textarea{font:inherit;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);min-height:40px}
 button{font:inherit;min-height:40px;padding:0 16px;border:0;border-radius:6px;background:var(--s1);color:#fff;cursor:pointer}
