@@ -324,3 +324,89 @@ export async function devicePage(db: D1Database, project: string, f: Filters, tz
     timeline: res[2].results as unknown as TailRow[],
   };
 }
+
+const USE = new Set(["booster_used", "booster_bought", "try_taken"]);
+const OFFER = new Set(["booster_offered", "try_offer_shown"]);
+const AD_SHOWN = new Set(["ad_shown", "interstitial_shown", "continue_watched"]);
+interface EconRow { day: string; name: string; currency: string; detail: string; n: number; v: number }
+
+/** Economy and ads from econ_days: currency flows, boosters, ads by format and revenue with ARPDAU. */
+export async function economy(db: D1Database, project: string, f: Filters) {
+  const res = await db.batch<Record<string, unknown>>([
+    db.prepare(`SELECT day, name, currency, detail, SUM(count) AS n, SUM(value_sum) AS v FROM econ_days
+      WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3 AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5)
+      GROUP BY day, name, currency, detail`).bind(project, f.from, f.to, f.v, f.p),
+    db.prepare(`SELECT COUNT(*) AS n FROM device_days WHERE project_id = ?1 AND day BETWEEN ?2 AND ?3
+      AND (?4 IS NULL OR version = ?4) AND (?5 IS NULL OR platform = ?5)`).bind(project, f.from, f.to, f.v, f.p),
+  ]);
+  const rows = res[0].results as unknown as EconRow[];
+  const days = Array.from({ length: f.days }, (_, i) => addDays(f.from, i));
+  const bump = <K>(m: Map<K, number>, k: K, n: number) => m.set(k, (m.get(k) ?? 0) + n);
+  const currencies = new Map<string, { earned: number; spent: number; earnedByDay: Map<string, number>; spentByDay: Map<string, number>; sources: Map<string, number>; sinks: Map<string, number> }>();
+  const boosters = new Map<string, { used: number; offered: number }>();
+  const ads = new Map<string, { shown: number; revenue: number; byDay: Map<string, number> }>();
+  const revenue = new Map<string, { ads: number; iap: number }>();
+  for (const r of rows) {
+    if (r.name === "currency_earned" || r.name === "currency_spent") {
+      const c = currencies.get(r.currency) ?? { earned: 0, spent: 0, earnedByDay: new Map(), spentByDay: new Map(), sources: new Map(), sinks: new Map() };
+      const earned = r.name === "currency_earned";
+      if (earned) { c.earned += r.v; bump(c.earnedByDay, r.day, r.v); bump(c.sources, r.detail, r.v); }
+      else { c.spent += r.v; bump(c.spentByDay, r.day, r.v); bump(c.sinks, r.detail, r.v); }
+      currencies.set(r.currency, c);
+    } else if (USE.has(r.name) || OFFER.has(r.name)) {
+      const b = boosters.get(r.detail) ?? { used: 0, offered: 0 };
+      if (USE.has(r.name)) b.used += r.n; else b.offered += r.n;
+      boosters.set(r.detail, b);
+    } else if (AD_SHOWN.has(r.name)) {
+      const a = ads.get(r.detail) ?? { shown: 0, revenue: 0, byDay: new Map() };
+      a.shown += r.n; a.revenue += r.v; bump(a.byDay, r.day, r.n);
+      ads.set(r.detail, a);
+      if (r.v) { const m = revenue.get(r.currency) ?? { ads: 0, iap: 0 }; m.ads += r.v; revenue.set(r.currency, m); }
+    } else if (r.name === "iap_purchase" && r.v) {
+      const m = revenue.get(r.currency) ?? { ads: 0, iap: 0 };
+      m.iap += r.v;
+      revenue.set(r.currency, m);
+    }
+  }
+  const top = (m: Map<string, number>) => [...m].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([label, value]) => ({ label: label || "(not set)", value }));
+  const deviceDays = (res[1].results[0]?.n as number) ?? 0;
+  return {
+    rowsRead: rowsRead(res), days,
+    currencies: [...currencies].sort((a, b) => b[1].earned - a[1].earned).map(([currency, c]) => ({
+      currency, earned: c.earned, spent: c.spent, sources: top(c.sources), sinks: top(c.sinks),
+      earnedByDay: days.map((d) => c.earnedByDay.get(d) ?? 0), spentByDay: days.map((d) => c.spentByDay.get(d) ?? 0),
+    })),
+    boosters: [...boosters].sort((a, b) => b[1].used - a[1].used || b[1].offered - a[1].offered).map(([booster, b]) => ({ booster, ...b })),
+    ads: [...ads].sort((a, b) => b[1].shown - a[1].shown).map(([format, a]) => ({
+      format, shown: a.shown, revenue: a.revenue, byDay: days.map((d) => a.byDay.get(d) ?? 0),
+    })),
+    revenue: [...revenue].map(([currency, m]) => ({ currency, ...m, total: m.ads + m.iap, arpdau: deviceDays ? (m.ads + m.iap) / deviceDays : null })),
+    deviceDays,
+  };
+}
+
+export const LIVE_MS = 30 * 60_000;
+/** Raw rows that arrived in the last 30 minutes: the index on arrival time bounds the read. */
+export async function live(db: D1Database, project: string, now: number) {
+  const res = await db.batch<Record<string, unknown>>([
+    db.prepare("SELECT COUNT(*) AS events, COUNT(DISTINCT device_id) AS devices FROM events WHERE project_id = ? AND received_at >= ?").bind(project, now - LIVE_MS),
+    db.prepare(`${TAIL} WHERE project_id = ? AND received_at >= ? ORDER BY received_at DESC LIMIT 50`).bind(project, now - LIVE_MS),
+  ]);
+  return {
+    rowsRead: rowsRead(res),
+    events: (res[0].results[0]?.events as number) ?? 0, devices: (res[0].results[0]?.devices as number) ?? 0,
+    tail: res[1].results as unknown as TailRow[],
+  };
+}
+
+/** Today's accepted events per project (UTC day, as the cap) and the database size. */
+export async function usageToday(db: D1Database, day: string, projects: string[]) {
+  const res = await db.batch<Record<string, unknown>>([db.prepare(
+    "SELECT project_id, events FROM usage WHERE project_id IN (SELECT value FROM json_each(?1)) AND day = ?2",
+  ).bind(JSON.stringify(projects.flatMap((p) => [p, `${p}~test`])), day)]);
+  return {
+    rowsRead: rowsRead(res),
+    events: new Map(res[0].results.map((r) => [r.project_id as string, r.events as number])),
+    bytes: (res[0].meta as { size_after?: number }).size_after ?? null,
+  };
+}

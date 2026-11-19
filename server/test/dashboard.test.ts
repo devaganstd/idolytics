@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { parseTz, tzLabel } from "../src/dashboard";
-import { at, NOW, seed } from "./fixture";
+import { at, NOW, seed, seedEconomy } from "./fixture";
 import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
@@ -44,6 +44,13 @@ describe("projects", () => {
     expect(ingest.status).toBe(202);
     const row = await env.DB.prepare("SELECT write_key_hash FROM projects WHERE id = 'my-game'").first<{ write_key_hash: string }>();
     expect(row!.write_key_hash).not.toContain("idl_w_");
+  });
+
+  it("gives no key for an id that already exists", async () => {
+    await create(BASE);
+    const again = await create(BASE);
+    expect(again.status).toBe(409);
+    expect((await env.DB.prepare("SELECT COUNT(*) AS n FROM keys").first())!.n).toBe(1);
   });
 
   it("refuses cross origin posts and missing auth", async () => {
@@ -179,6 +186,7 @@ describe("raw filters, events and device pages", () => {
   it("joins property filters with AND", async () => {
     const html = await (await get(`/levels?project=demo&${RANGE}&prop=stars%3D3&prop=moves_left%3D2`)).text();
     expect(cells(html, "1")?.slice(0, 4)).toEqual(["1", "0", "0", "1"]); // only the level_complete matches: no starts, one win
+    expect(cells(html, "1")?.[8]).toBe("–"); // attempts per win needs starts
     expect(cells(html, "2")).toBeUndefined();
     const none = await (await get(`/levels?project=demo&${RANGE}&prop=stars%3D3&prop=moves_left%3D9`)).text();
     expect(cells(none, "1")).toBeUndefined();
@@ -220,6 +228,78 @@ describe("raw filters, events and device pages", () => {
     const timeline = html.slice(html.indexOf("Timeline"));
     expect((timeline.match(/<tr><td>/g) ?? []).length).toBe(9);
     expect(timeline.indexOf("booster_used")).toBeLessThan(timeline.indexOf("session_start"));
+  });
+});
+
+describe("economy, live and settings", () => {
+  beforeEach(async () => {
+    await createProject();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at(20, 12));
+  });
+  afterEach(() => vi.useRealTimers());
+
+  it("hides the Levels and Economy tabs until their events arrive", async () => {
+    await raw({ name: "session_start", device: "d1", session: "a", ts: at(0, 10) });
+    await rollUp(NOW);
+    const html = await (await get(`/?project=demo&${RANGE}`)).text();
+    expect(html).not.toMatch(/>Levels<\/a>/);
+    expect(html).not.toMatch(/>Economy<\/a>/);
+    expect(await (await get(`/economy?project=demo&${RANGE}`)).text()).toContain("No economy or ad events in this range.");
+    await seed();
+    await seedEconomy();
+    await rollUp(NOW);
+    const after = await (await get(`/?project=demo&${RANGE}`)).text();
+    expect(after).toMatch(/>Levels<\/a>/);
+    expect(after).toMatch(/>Economy<\/a>/);
+  });
+
+  it("shows currency, boosters, ads and ARPDAU from rollups", async () => {
+    await seedEconomy();
+    await rollUp(NOW);
+    const res = await get(`/economy?project=demo&range=custom&from=2026-11-01&to=2026-11-02`);
+    const html = await res.text();
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeGreaterThan(0);
+    expect(cells(html, "coins")).toEqual(["coins", "170", "30"]);
+    expect(html).toContain("level_reward: 120");
+    expect(html).toContain("daily_gift: 50");
+    expect(html).toContain("booster: 30");
+    expect(cells(html, "hammer")).toEqual(["hammer", "2", "1"]);
+    expect(cells(html, "bomb")).toEqual(["bomb", "1", "0"]);
+    expect(cells(html, "free")).toEqual(["free", "0", "1"]);
+    expect(cells(html, "interstitial")).toEqual(["interstitial", "2", "0.02"]);
+    expect(cells(html, "rewarded")).toEqual(["rewarded", "2", "0.05"]);
+    expect(cells(html, "USD")).toEqual(["USD", "1.06", "0.07", "0.99", "0.35"]); // 1.06 over 3 device days
+    // A module with no events in the range is hidden.
+    const day2 = await (await get(`/economy?project=demo&range=custom&from=2026-11-02&to=2026-11-02`)).text();
+    expect(day2).toContain("Currency");
+    expect(day2).not.toContain("Boosters");
+    expect(day2).not.toContain("Ads");
+  });
+
+  it("shows the last 30 minutes from raw rows", async () => {
+    const now = at(20, 12);
+    await raw({ name: "tap", device: "d1", session: "a", ts: now - 5 * 60_000 });
+    await raw({ name: "tap", device: "d1", session: "a", ts: now - 6 * 60_000 });
+    await raw({ name: "level_start", device: "d2", session: "b", ts: now - 20 * 60_000, level: "4" });
+    await raw({ name: "tap", device: "d3", session: "c", ts: now - 40 * 60_000 });
+    const res = await get("/live?project=demo");
+    const html = await res.text();
+    expect(html).toMatch(/data-kpi="devices"[^>]*><h3>[^<]*<\/h3><p class="value">2</);
+    expect(html).toMatch(/data-kpi="events"[^>]*><h3>[^<]*<\/h3><p class="value">3</);
+    expect((html.slice(html.indexOf("Newest events")).match(/<tr><td>/g) ?? []).length).toBe(3);
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeLessThan(20);
+  });
+
+  it("shows projects, the daily cap with today's usage and a D1 estimate", async () => {
+    await env.DB.prepare("INSERT INTO usage (project_id, day, events) VALUES ('demo', '2026-11-21', 40)").run();
+    const html = await (await get("/settings?project=demo")).text();
+    expect(cells(html, "demo")?.slice(0, 2)).toEqual(["demo", "demo"]);
+    expect(html).toContain("40 of 50 events today");
+    expect(html).toMatch(/class="meter warn"/); // 80% of the cap
+    expect(html).toContain("Estimated D1 rows written today");
+    expect(html).toContain("Reporting time zone");
+    expect(html).toContain("Create test key");
   });
 });
 

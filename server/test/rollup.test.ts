@@ -1,8 +1,9 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { DAY } from "../src/rollup";
-import { at, MIN, NOW, seed } from "./fixture";
+import { at, MIN, NOW, seed, seedEconomy } from "./fixture";
 import { createProject, raw, reset, rollUp, rows } from "./helpers";
+import { runCron } from "../src/rollup";
 
 const table = (t: string, cols: string, order: string) => rows(`SELECT ${cols} FROM ${t} ORDER BY ${order}`);
 const snapshot = async () => ({
@@ -125,6 +126,29 @@ describe("rollup", () => {
     ]);
   });
 
+  it("rolls up economy and ad events by currency and detail", async () => {
+    await seedEconomy();
+    await raw({ name: "tap", device: "d1", session: "a", ts: at(0, 10) });
+    await rollUp(NOW);
+    const econ = await rows("SELECT day, name, currency, detail, platform, count, value_sum FROM econ_days ORDER BY day, name, detail");
+    expect(econ.map((r) => [r.day, r.name, r.currency, r.detail, r.count, r.value_sum])).toEqual([
+      ["2026-11-01", "ad_shown", "USD", "interstitial", 1, 0.02],
+      ["2026-11-01", "ad_shown", "USD", "rewarded", 1, 0.05],
+      ["2026-11-01", "booster_bought", "", "bomb", 1, 0],
+      ["2026-11-01", "booster_offered", "", "hammer", 1, 0],
+      ["2026-11-01", "booster_used", "", "hammer", 1, 0],
+      ["2026-11-01", "continue_watched", "", "rewarded", 1, 0],
+      ["2026-11-01", "currency_earned", "coins", "daily_gift", 1, 50],
+      ["2026-11-01", "currency_earned", "coins", "level_reward", 1, 100],
+      ["2026-11-01", "currency_spent", "coins", "booster", 1, 30],
+      ["2026-11-01", "iap_purchase", "USD", "starter", 1, 0.99],
+      ["2026-11-01", "interstitial_shown", "", "interstitial", 1, 0],
+      ["2026-11-01", "try_offer_shown", "", "free", 1, 0],
+      ["2026-11-01", "try_taken", "", "hammer", 1, 0],
+      ["2026-11-02", "currency_earned", "coins", "level_reward", 1, 20],
+    ]);
+  });
+
   it("keeps every row when many share one arrival time", async () => {
     for (let i = 0; i < 5; i++) await raw({ name: "tap", device: "d1", session: "a", ts: at(0, 10), received: at(0, 10) });
     await rollUp(NOW, 2);
@@ -137,5 +161,31 @@ describe("rollup", () => {
     await rollUp(NOW);
     expect(await rows("SELECT client_ts FROM events")).toEqual([{ client_ts: NOW - 89 * DAY }]);
     expect((await snapshot()).deviceDays).toHaveLength(2);
+  });
+});
+
+describe("cron", () => {
+  beforeEach(reset);
+
+  it("rolls up projects in rotation when they do not all fit in one run", async () => {
+    const ids = ["p1", "p2", "p3", "p4", "p5", "p6"];
+    for (const id of ids) {
+      await env.DB.prepare("INSERT INTO projects (id, name, created_at, write_key_hash) VALUES (?, ?, ?, ?)").bind(id, id, 1, id).run();
+      await env.DB.prepare("INSERT INTO events (project_id, event_id, name, device_id, session_id, client_ts, received_at) VALUES (?, 'e', 'tap', 'd', 's', ?, ?)")
+        .bind(id, at(0, 10), at(0, 10)).run();
+    }
+    const done = async () => (await rows("SELECT id FROM projects WHERE wm_at > 0 ORDER BY id")).map((r) => r.id);
+    await runCron(env.DB, at(0, 12));
+    const first = await done();
+    expect(first.length).toBeGreaterThan(0);
+    expect(first.length).toBeLessThan(ids.length);
+    await runCron(env.DB, at(0, 12, 15));
+    expect(await done()).toEqual(ids);
+  });
+
+  it("rolls up many idle projects in one run", async () => {
+    for (let i = 0; i < 12; i++) await env.DB.prepare("INSERT INTO projects (id, name, created_at, write_key_hash, tz_min, rollup_tz) VALUES (?, ?, 1, ?, 0, 0)").bind(`p${i}`, `p${i}`, `h${i}`).run();
+    const res = await runCron(env.DB, at(0, 12));
+    expect(res).toEqual({ projects: 12, of: 12 });
   });
 });

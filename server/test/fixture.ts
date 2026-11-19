@@ -32,3 +32,28 @@ export async function seed() {
   await e("session_start", "d2", "e", at(2, 8, 0), ios);
 }
 
+
+/**
+ * Hand counted economy and ads, 11-01 and 11-02. coins: earned 170 (level_reward 120, daily_gift 50), spent 30 (booster).
+ * Boosters: hammer used 2 offered 1, bomb used 1, offer mode free 1. Ads: interstitial 2 (0.02 USD), rewarded 2 (0.05 USD).
+ * IAP 0.99 USD. Revenue 1.06 USD over 3 device days: ARPDAU 0.35.
+ */
+export async function seedEconomy() {
+  const ios = { platform: "ios", country: "US" };
+  const e = (name: string, device: string, ts: number, more: Record<string, unknown> = {}) =>
+    raw({ name, device, session: device + "s", ts, ...(device === "d2" ? ios : {}), ...more });
+  await e("currency_earned", "d1", at(0, 10), { value: 100, currency: "coins", props: { source: "level_reward" } });
+  await e("currency_earned", "d2", at(0, 11), { value: 50, currency: "coins", props: { source: "daily_gift" } });
+  await e("currency_spent", "d1", at(0, 12), { value: 30, currency: "coins", props: { sink: "booster" } });
+  await e("currency_earned", "d1", at(1, 10), { value: 20, currency: "coins", props: { source: "level_reward" } });
+  await e("booster_used", "d1", at(0, 10, 5), { level: "1", props: { booster: "hammer", source: "stock" } });
+  await e("booster_bought", "d2", at(0, 11, 5), { level: "1", props: { booster: "bomb" } });
+  await e("try_taken", "d1", at(0, 10, 6), { level: "1", props: { booster: "hammer", free: 1 } });
+  await e("booster_offered", "d2", at(0, 11, 6), { props: { booster: "hammer" } });
+  await e("try_offer_shown", "d1", at(0, 10, 7), { props: { mode: "free" } });
+  await e("ad_shown", "d1", at(0, 10, 8), { value: 0.02, currency: "USD", props: { format: "interstitial" } });
+  await e("ad_shown", "d2", at(0, 11, 8), { value: 0.05, currency: "USD", props: { format: "rewarded" } });
+  await e("interstitial_shown", "d1", at(0, 10, 9), { level: "1" });
+  await e("continue_watched", "d1", at(0, 10, 10), { level: "1" });
+  await e("iap_purchase", "d2", at(0, 11, 9), { value: 0.99, currency: "USD", props: { product: "starter" } });
+}

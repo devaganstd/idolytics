@@ -6,9 +6,11 @@ export const WRITE_KEY = "idl_w_testkeytestkeytestkeytestkey";
 export const BASE = "https://idolytics.test";
 
 export async function createProject(id = "demo", key = WRITE_KEY) {
-  await env.DB.prepare("INSERT INTO projects (id, name, created_at, write_key_hash) VALUES (?, ?, ?, ?)")
-    .bind(id, id, Date.now(), await sha256Hex(key))
-    .run();
+  const hash = await sha256Hex(key);
+  await env.DB.batch([
+    env.DB.prepare("INSERT INTO projects (id, name, created_at, write_key_hash) VALUES (?, ?, ?, ?)").bind(id, id, Date.now(), hash),
+    env.DB.prepare("INSERT INTO keys (key_hash, project_id, env) VALUES (?, ?, 'live')").bind(hash, id),
+  ]);
 }
 
 let n = 0;
@@ -40,7 +42,7 @@ export async function rows(sql = "SELECT * FROM events ORDER BY client_ts, event
 }
 
 export async function reset() {
-  await env.DB.batch(["events", "projects", "usage", "devices", "device_days", "cohort_days", "level_days", "event_days", "level_events"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
+  await env.DB.batch(["events", "projects", "usage", "devices", "device_days", "cohort_days", "level_days", "event_days", "level_events", "econ_days", "keys"].map((t) => env.DB.prepare(`DELETE FROM ${t}`)));
 }
 
 let stored = 0;
@@ -55,12 +57,12 @@ let rawRow = 0;
 /** Inserts a full raw row for project demo. ts and received default to each other. */
 export async function raw(e: {
   name: string; device: string; session: string; ts: number; received?: number; version?: string; platform?: string;
-  country?: string; level?: string; attempt?: number; duration?: number; value?: number; props?: Record<string, unknown>; id?: string;
+  country?: string; level?: string; attempt?: number; duration?: number; value?: number; currency?: string; props?: Record<string, unknown>; id?: string;
 }) {
   await env.DB.prepare(INSERT_EVENT)
     .bind("demo", e.id ?? `r-${String(++rawRow).padStart(6, "0")}`, e.name, e.device, e.session, null, e.ts, e.received ?? e.ts,
       e.version ?? "1.0", e.platform ?? "android", null, e.country ?? "ID", e.level ?? null, e.attempt ?? null,
-      e.duration ?? null, e.value ?? null, null, e.props ? JSON.stringify(e.props) : null)
+      e.duration ?? null, e.value ?? null, e.currency ?? null, e.props ? JSON.stringify(e.props) : null)
     .run();
 }
 

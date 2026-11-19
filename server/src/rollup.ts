@@ -14,6 +14,23 @@ const CHUNK = 1000;
 const KEEP_AGED_MS = 2 * DAY;
 const DELETE_CHUNK = 5000;
 const LEVEL_EVENTS = new Set(["level_start", "level_complete", "level_fail", "level_quit"]);
+/** Ninja Smash ad events, counted with this ad format. */
+const AD_ALIAS: Record<string, string> = { interstitial_shown: "interstitial", continue_watched: "rewarded" };
+const ECON_NAMES = ["iap_purchase", "try_taken", "try_offer_shown", ...Object.keys(AD_ALIAS)];
+const isEcon = (name: string) => /^(currency|booster|ad)_/.test(name) || ECON_NAMES.includes(name);
+const ECON_SQL = `name GLOB 'currency_*' OR name GLOB 'booster_*' OR name GLOB 'ad_*' OR name IN (${ECON_NAMES.map((n) => `'${n}'`).join(", ")})`;
+/** First scalar props value of these keys, at most 40 characters, else "". */
+const detailOf = (props: Record<string, unknown>, keys: string[]) => {
+  const d = keys.map((k) => props[k]).find((v) => v !== undefined);
+  return typeof d === "string" || typeof d === "number" || typeof d === "boolean" ? String(d).slice(0, 40) : "";
+};
+/** The props key that names what an economy event is about: the booster, the ad format, the source or sink. */
+const econKeys = (name: string) => name.startsWith("booster_") ? ["booster"] : name.startsWith("try_") ? ["booster", "mode"] : name.startsWith("ad_") ? ["format"]
+  : name === "iap_purchase" ? ["product"] : name === "currency_spent" ? ["sink"] : ["source", "sink"];
+/** The free plan allows 50 D1 queries per invocation; keep a margin. */
+const QUERY_BUDGET = 48;
+/** The most queries one project can take in a run: select, rebuild, reads and writes. */
+const WORST_PROJECT = 22;
 
 /** Local calendar day of an epoch ms time, for a fixed offset in minutes east of UTC. */
 export const dayOf = (ts: number, tzMin: number) => new Date(ts + tzMin * 60_000).toISOString().slice(0, 10);
@@ -25,7 +42,7 @@ export interface Project {
 interface Raw {
   event_id: string; name: string; device_id: string; session_id: string; client_ts: number; received_at: number;
   app_version: string | null; platform: string | null; country: string | null; level: string | null;
-  attempt: number | null; duration_ms: number | null; value: number | null; props: string | null;
+  attempt: number | null; duration_ms: number | null; value: number | null; currency: string | null; props: string | null;
 }
 /** An unclosed level start: received at, day, version, platform, level, counted as a quit. */
 interface Open { r: number; d: string; v: string; p: string; l: string; q?: 1 }
@@ -33,22 +50,49 @@ interface Dev { first_day: string; version: string; platform: string; country: s
 interface Seen { s: Record<string, [number, number]>; n: string[]; l: string[] }
 interface DevDay { version: string; platform: string; country: string; is_new: number; events: number; seen: Seen; dirty: boolean }
 
+/**
+ * Rolls up the projects that have work: new raw rows, a rebuild, or a level start old enough to become a quit.
+ * Idle projects cost nothing but a shared raw retention delete. Busy projects run least recently rolled up
+ * first, as many as fit in the query budget; the rest go first in the next run.
+ */
 export async function runCron(db: D1Database, now: number) {
+  const hi = now - LAG_MS;
   const { results } = await db.prepare(
-    "SELECT id, tz_min, rollup_tz, wm_at, wm_id, rebuild_from, rebuild_until FROM projects ORDER BY created_at",
-  ).all<Project>();
-  // shortcut: every project in one invocation; the free plan allows 50 D1 queries per invocation (about 4 projects), rotate projects if more are needed
-  for (const p of results) await rollupProject(db, p, now);
+    `SELECT id, tz_min, rollup_tz, wm_at, wm_id, rebuild_from, rebuild_until,
+       tz_min <> rollup_tz OR rebuild_until IS NOT NULL
+       OR EXISTS (SELECT 1 FROM events e WHERE e.project_id = p.id AND (e.received_at, e.event_id) > (p.wm_at, p.wm_id) AND e.received_at <= ?1)
+       OR EXISTS (SELECT 1 FROM devices d WHERE d.project_id = p.id AND d.open_min < ?2) AS busy
+     FROM projects p ORDER BY cron_at, created_at, id`,
+  ).bind(hi, hi - QUIT_AFTER_MS).all<Project & { busy: number }>();
+  const idle = results.filter((p) => !p.busy).map((p) => p.id);
+  const done = [...idle];
+  const cost = { queries: 3 }; // the list above, then the retention delete and cron_at update below
+  for (const p of results.filter((r) => r.busy)) {
+    if (cost.queries + WORST_PROJECT > QUERY_BUDGET) break;
+    await rollupProject(db, p, now, CHUNK, cost);
+    done.push(p.id);
+  }
+  await db.batch([
+    // Raw retention for idle projects: all their rows are rolled up. Busy projects delete their own.
+    db.prepare(`DELETE FROM events WHERE project_id IN (SELECT value FROM json_each(?1)) AND event_id IN
+      (SELECT event_id FROM events WHERE project_id IN (SELECT value FROM json_each(?1)) AND received_at < ?2 LIMIT ${DELETE_CHUNK})`)
+      .bind(JSON.stringify(idle), now - RAW_KEEP_DAYS * DAY),
+    db.prepare("UPDATE projects SET cron_at = ?2 WHERE id IN (SELECT value FROM json_each(?1))").bind(JSON.stringify(done), now),
+  ]);
+  return { projects: done.length, of: results.length };
 }
 
 /** Rolls up one chunk of new raw rows and ages out quits. Returns the number of raw rows read. */
-export async function rollupProject(db: D1Database, project: Project, now: number, chunk = CHUNK): Promise<number> {
+export async function rollupProject(db: D1Database, project: Project, now: number, chunk = CHUNK, cost = { queries: 0 }): Promise<number> {
+  if (project.tz_min !== project.rollup_tz) cost.queries += 9; // startRebuild's batch
   const p = project.tz_min === project.rollup_tz ? project : await startRebuild(db, project, now);
+  cost.queries += 4; // the raw select and three reads
   const tz = p.tz_min;
   const hi = now - LAG_MS;
   const rows = (await db.prepare(
     `SELECT event_id, name, device_id, session_id, client_ts, received_at, app_version, platform, country, level,
-       attempt, duration_ms, value, CASE WHEN level IS NOT NULL AND name <> 'level_start' THEN props END AS props
+       attempt, duration_ms, value, currency,
+       CASE WHEN (level IS NOT NULL AND name <> 'level_start') OR ${ECON_SQL} THEN props END AS props
      FROM events WHERE project_id = ?1 AND (received_at, event_id) > (?2, ?3) AND received_at <= ?4
      ORDER BY received_at, event_id LIMIT ?5`,
   ).bind(p.id, p.wm_at, p.wm_id, hi, chunk).all<Raw>()).results;
@@ -99,6 +143,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   const events = new Map<string, Record<string, number>>();
   const cohorts = new Map<string, Record<string, number>>();
   const levelEvents = new Map<string, Record<string, number>>();
+  const econ = new Map<string, Record<string, number>>();
   const add = (m: Map<string, Record<string, number>>, key: unknown[], field: string, n: number) => {
     const k = JSON.stringify(key);
     const o = m.get(k) ?? {};
@@ -126,12 +171,15 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     if (r.value !== null) add(events, ek, "value_sum", r.value);
     if (!dd.seen.n.includes(r.name)) { dd.seen.n.push(r.name); add(events, ek, "devices", 1); }
 
-    if (r.level === null) continue;
     const props = r.props ? JSON.parse(r.props) as Record<string, unknown> : {};
+    if (isEcon(r.name)) {
+      const k = [day, r.name, r.currency ?? "", AD_ALIAS[r.name] ?? detailOf(props, econKeys(r.name)), v, pl];
+      add(econ, k, "count", 1);
+      add(econ, k, "value_sum", r.value ?? 0);
+    }
+    if (r.level === null) continue;
     if (r.name !== "level_start" && r.name !== "level_complete") {
-      const d = props.reason ?? props.via ?? props.booster;
-      const detail = typeof d === "string" || typeof d === "number" || typeof d === "boolean" ? String(d).slice(0, 40) : "";
-      add(levelEvents, [day, r.level, r.name, String(detail), v, pl], "count", 1);
+      add(levelEvents, [day, r.level, r.name, detailOf(props, ["reason", "via", "booster"]), v, pl], "count", 1);
     }
     if (!LEVEL_EVENTS.has(r.name)) continue;
     const lk = [day, r.level, v, pl];
@@ -188,7 +236,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   const endRebuild = p.rebuild_until !== null && (caughtUp || last!.received_at > p.rebuild_until);
   const retentionCutoff = Math.min(now - RAW_KEEP_DAYS * DAY, last?.received_at ?? p.wm_at);
 
-  await db.batch([
+  const writes = [
     ...upsert(`INSERT INTO devices (project_id, device_id, first_day, version, platform, country, open, open_min)
       SELECT ?1, ${col(7)} FROM json_each(?2) WHERE true
       ON CONFLICT (project_id, device_id) DO UPDATE SET open = excluded.open, open_min = excluded.open_min`, devRows),
@@ -212,13 +260,19 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
       SELECT ?1, ${col(7)} FROM json_each(?2) WHERE true
       ON CONFLICT (project_id, day, level, name, detail, version, platform) DO UPDATE SET ${sum("level_events", ["count"])}`,
       flat(levelEvents, ["count"])),
+    ...upsert(`INSERT INTO econ_days (project_id, day, name, currency, detail, version, platform, count, value_sum)
+      SELECT ?1, ${col(8)} FROM json_each(?2) WHERE true
+      ON CONFLICT (project_id, day, name, currency, detail, version, platform) DO UPDATE SET ${sum("econ_days", ["count", "value_sum"])}`,
+      flat(econ, ["count", "value_sum"])),
     db.prepare(`UPDATE projects SET wm_at = ?2, wm_id = ?3,
         rebuild_from = CASE WHEN ?4 THEN NULL ELSE rebuild_from END, rebuild_until = CASE WHEN ?4 THEN NULL ELSE rebuild_until END
       WHERE id = ?1`).bind(p.id, last?.received_at ?? p.wm_at, last?.event_id ?? p.wm_id, endRebuild ? 1 : 0),
     // Raw retention: only rows already rolled up, at most DELETE_CHUNK per run.
     db.prepare(`DELETE FROM events WHERE project_id = ?1 AND event_id IN
       (SELECT event_id FROM events WHERE project_id = ?1 AND received_at < ?2 LIMIT ${DELETE_CHUNK})`).bind(p.id, retentionCutoff),
-  ]);
+  ];
+  cost.queries += writes.length;
+  await db.batch(writes);
   return rows.length;
 }
 
@@ -240,7 +294,7 @@ async function startRebuild(db: D1Database, p: Project, now: number): Promise<Pr
     wm_id: p.wm_at <= from - DAY ? p.wm_id : "",
   };
   await db.batch([
-    ...["device_days", "level_days", "event_days", "cohort_days", "level_events"].map((t) =>
+    ...["device_days", "level_days", "event_days", "cohort_days", "level_events", "econ_days"].map((t) =>
       db.prepare(`DELETE FROM ${t} WHERE project_id = ? AND day >= ?`).bind(p.id, day)),
     db.prepare("DELETE FROM devices WHERE project_id = ? AND first_day >= ?").bind(p.id, day),
     db.prepare("UPDATE devices SET open = NULL, open_min = NULL WHERE project_id = ? AND open IS NOT NULL").bind(p.id),

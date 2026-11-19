@@ -3,6 +3,11 @@ import { sha256Hex } from "./keys";
 export const MAX_BODY_BYTES = 64 * 1024;
 export const MAX_EVENTS = 100;
 export const DEFAULT_DAILY_CAP = 20_000;
+/** Events accepted per project per UTC day: DAILY_EVENT_CAP when it is a number, else the default. */
+export const dailyCap = (env: Env) => {
+  const cap = Number(env.DAILY_EVENT_CAP);
+  return Number.isFinite(cap) && cap >= 0 && env.DAILY_EVENT_CAP ? cap : DEFAULT_DAILY_CAP;
+};
 const NAME = /^[a-z][a-z0-9_]{0,39}$/;
 const DAY = 86_400_000;
 // Keys that would carry personal data. Allows keys such as step_name or level_name.
@@ -71,14 +76,15 @@ export async function ingest(request: Request, env: Env): Promise<Response> {
 
   const now = Date.now();
   const day = new Date(now).toISOString().slice(0, 10);
+  // A test key writes to the hidden sibling project "<id>~test".
   const project = await env.DB.prepare(
-    `SELECT p.id, COALESCE(u.events, 0) AS used FROM projects p
-     LEFT JOIN usage u ON u.project_id = p.id AND u.day = ? WHERE p.write_key_hash = ?`,
-  ).bind(day, await sha256Hex(key)).first<{ id: string; used: number }>();
+    `SELECT k.id, COALESCE(u.events, 0) AS used
+     FROM (SELECT project_id || CASE env WHEN 'test' THEN '~test' ELSE '' END AS id FROM keys WHERE key_hash = ?) k
+     LEFT JOIN usage u ON u.project_id = k.id AND u.day = ?`,
+  ).bind(await sha256Hex(key), day).first<{ id: string; used: number }>();
   if (!project) return json({ error: "unknown write key" }, 401);
   // Checked before the batch: requests in flight at the same time can each pass it by one batch.
-  const cap = Number(env.DAILY_EVENT_CAP);
-  if (project.used >= (Number.isFinite(cap) && cap >= 0 && env.DAILY_EVENT_CAP ? cap : DEFAULT_DAILY_CAP)) {
+  if (project.used >= dailyCap(env)) {
     const toMidnight = Math.ceil((Date.parse(day) + DAY - now) / 1000);
     return Response.json({ error: "daily event cap reached" }, { status: 429, headers: { ...CORS, "Retry-After": String(toMidnight) } });
   }

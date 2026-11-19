@@ -7,7 +7,7 @@ Open source game analytics you host yourself. See where players win, lose and qu
 - Level first: starts, wins, losses, win rate, attempts per win and quits per level.
 - Plain HTTP JSON API for any other engine.
 
-Status: 0.2.1. The dashboard reads daily rollups and has a filter bar, an overview, retention cohorts, levels with a progression funnel and level detail, events, and a device page. See [what is not in yet](#not-in-yet).
+Status: 0.2.2. The dashboard reads daily rollups and has a filter bar, an overview, retention cohorts, levels with a progression funnel and level detail, economy and ads, events, a device page, a live view and settings, plus test and live write keys. See [what is not in yet](#not-in-yet).
 
 ## Quickstart
 
@@ -74,6 +74,13 @@ Reload the server URL about 15 minutes later. A cron job rolls new events up int
 - **Levels:** a sortable table of starts, distinct players, wins, fails, quits (inferred), win rate, first try win rate, attempts per win, average duration, and average stars and moves left when the game sends them; a progression funnel of players who started each level. Select a level for its numbers by day and by version, and its fail and quit reasons, boosters and continues.
 - **Events:** any event over time, a breakdown by one props key (top 20 values), and the 100 newest raw events, filterable by name and device.
 - **Device:** one device's install, its active days and its raw events newest first. A device id in the Events tail links to it.
+- **Economy:** currency earned and spent per currency by day with the top sources and sinks, boosters used and offered, ads shown per format per day, and revenue and ARPDAU when events send `value`.
+- **Live:** devices and events in the last 30 minutes, and the newest raw events. It reads raw events, so it does not wait for the cron.
+- **Settings:** the projects, the reporting time zone, today's events against the daily cap, a D1 usage estimate, and the test key.
+
+The Levels and Economy tabs show only when the project has their events.
+
+Each project has a live write key (from step 2) and can have a test key, created and rotated in Settings and shown once. Events sent with the test key go to a hidden test copy of the project; switch between Live and Test at the top of the page. Use the test key in editor and development builds so test plays never mix with real players.
 
 The filter bar sets the date range (a preset, or custom dates; select a day in the chart to see only that day), the comparison, version, platform, country and new or returning players. Filters live in the URL, so a filtered view can be bookmarked.
 
@@ -110,7 +117,7 @@ idolytics sends nothing to its authors. The SDK uses a random install id and no 
 
 ## Not in yet
 
-Planned for 0.2 and later (see [docs/06-roadmap.md](docs/06-roadmap.md) and [docs/08-dashboard-v0.2.md](docs/08-dashboard-v0.2.md)): owner accounts instead of one admin key, a live view, economy and ads, rate limiting, a Deploy to Cloudflare button, a consent switch, typed helpers such as `Idolytics.LevelStart`, device deletion and export, Docker, and the Firebase BigQuery and Remote Config connectors.
+Planned for 0.2 and later (see [docs/06-roadmap.md](docs/06-roadmap.md) and [docs/08-dashboard-v0.2.md](docs/08-dashboard-v0.2.md)): owner accounts instead of one admin key, rate limiting, a Deploy to Cloudflare button, a consent switch, typed helpers such as `Idolytics.LevelStart`, device deletion and export, Docker, and the Firebase BigQuery and Remote Config connectors.
 
 ## Repository
 

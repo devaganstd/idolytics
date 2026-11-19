@@ -110,7 +110,19 @@ How the dashboard reads them:
 |---|---|
 | `booster_used` | `level`, `attempt`, `props.booster`, `props.source` (`stock`, `trial`, `gift`) |
 
-The economy module planned for 0.2.2 also counts the Ninja Smash events `booster_bought` and `try_taken` as booster use, grouped by `props.booster`.
+The Economy page also counts `booster_bought` and the Ninja Smash event `try_taken` as booster use, and `booster_offered` and the Ninja Smash event `try_offer_shown` as offers, grouped by `props.booster`.
+
+### Economy and ads
+
+| Event | Fields |
+|---|---|
+| `currency_earned` | `currency`, `value` (the amount), `props.source` |
+| `currency_spent` | `currency`, `value` (the amount), `props.sink` |
+| `booster_offered` | `props.booster` |
+| `ad_shown` | `props.format` (`interstitial`, `rewarded`, `banner`), `value` (revenue, if known), `currency` (of the revenue) |
+| `iap_purchase` | `props.product`, `value` (the price), `currency` |
+
+Ninja Smash's `interstitial_shown` and `continue_watched` count as `ad_shown` with the format `interstitial` and `rewarded`. Revenue and ARPDAU show only for events that send `value` with a `currency`. Each of these events is rolled up into one row per day, name, currency, detail, version and platform, so keep sources, sinks, boosters and products to a short fixed list.
 
 ## Custom events
 

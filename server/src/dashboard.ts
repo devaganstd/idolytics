@@ -1,8 +1,9 @@
 import { esc } from "./html";
+import { dailyCap } from "./ingest";
 import { newWriteKey, safeEqual, sha256Hex } from "./keys";
 import {
-  cohortTable, devicePage, eventsPage, type Filters, type Kpis, levelDetail, type LevelRow, levelTable, overview, parseFilters, RANGES,
-  RAW_MAX_DAYS, type TailRow,
+  cohortTable, devicePage, economy, eventsPage, type Filters, type Kpis, levelDetail, type LevelRow, levelTable, live, LIVE_MS, overview,
+  parseFilters, RANGES, RAW_MAX_DAYS, type TailRow, usageToday,
 } from "./queries";
 import { dayOf, QUIT_AFTER_MS } from "./rollup";
 import { barList, dayBars } from "./svg";
@@ -44,8 +45,11 @@ export async function createProject(request: Request, env: Env): Promise<Respons
     return page("New project", `<section><p class="error">The id must be 1 to 40 lowercase letters, digits or dashes.</p>${back}</section>`, 400);
   }
   const key = newWriteKey();
-  const res = await env.DB.prepare("INSERT OR IGNORE INTO projects (id, name, created_at, write_key_hash) VALUES (?, ?, ?, ?)")
-    .bind(id, name, Date.now(), await sha256Hex(key)).run();
+  const hash = await sha256Hex(key);
+  const [res] = await env.DB.batch([
+    env.DB.prepare("INSERT OR IGNORE INTO projects (id, name, created_at, write_key_hash) VALUES (?, ?, ?, ?)").bind(id, name, Date.now(), hash),
+    env.DB.prepare("INSERT INTO keys (key_hash, project_id, env) SELECT ?1, ?2, 'live' WHERE changes() > 0").bind(hash, id),
+  ]);
   if (!res.meta.changes) return page("New project", `<section><p class="error">A project with id ${esc(id)} already exists.</p>${back}</section>`, 409);
   return page("Project created", `<section><h2>${esc(name)} is ready</h2>
     <p>Copy the write key now. It is shown once and stored only as a hash.</p>
@@ -76,13 +80,44 @@ export async function setTimezone(request: Request, env: Env): Promise<Response>
   const form = await request.formData();
   const tz = parseTz(String(form.get("tz") ?? ""));
   if (tz === null) return new Response("Time zone must be minutes from -720 to 840", { status: 400 });
-  await env.DB.prepare("UPDATE projects SET tz_min = ? WHERE id = ?").bind(tz, String(form.get("project") ?? "")).run();
+  // The test sibling follows its project.
+  await env.DB.prepare("UPDATE projects SET tz_min = ?1 WHERE id IN (?2, ?2 || '~test')").bind(tz, String(form.get("project") ?? "")).run();
   const back = String(form.get("back") ?? "/");
   return new Response(null, { status: 303, headers: { Location: /^\/(?![/\\])[^\x00-\x1f]*$/.test(back) ? back : "/" } });
 }
 
-interface Proj { id: string; name: string; tz_min: number; rollup_tz: number; wm_at: number; rebuild_until: number | null }
-const PAGES: Record<string, string> = { "/": "Overview", "/retention": "Retention", "/levels": "Levels", "/events": "Events" };
+/**
+ * POST /settings/test-key: creates or rotates a project's test key. Test events go to the hidden sibling
+ * project "<id>~test", created here on the first key with the parent's time zone. The key is shown once.
+ */
+export async function createTestKey(request: Request, env: Env): Promise<Response> {
+  if (!sameOrigin(request)) return new Response("Cross origin form refused", { status: 403 });
+  const id = String((await request.formData()).get("project") ?? "");
+  const parent = id.includes("~") ? null : await env.DB.prepare("SELECT id, name FROM projects WHERE id = ?").bind(id).first<{ id: string; name: string }>();
+  if (!parent) return new Response("Unknown project", { status: 404 });
+  const key = newWriteKey();
+  await env.DB.batch([
+    // write_key_hash is unused for siblings since keys came in; it only has to be unique.
+    env.DB.prepare(`INSERT OR IGNORE INTO projects (id, name, created_at, write_key_hash, tz_min, rollup_tz)
+      SELECT id || '~test', name || ' (test)', ?2, 'sibling:' || id, tz_min, tz_min FROM projects WHERE id = ?1`).bind(id, Date.now()),
+    env.DB.prepare("DELETE FROM keys WHERE project_id = ? AND env = 'test'").bind(id),
+    env.DB.prepare("INSERT INTO keys (key_hash, project_id, env) VALUES (?, ?, 'test')").bind(await sha256Hex(key), id),
+  ]);
+  return page("Test key", `<section><h2>Test key for ${esc(parent.name)}</h2>
+    <p>Copy the test key now. It is shown once and stored only as a hash. Any earlier test key no longer works.</p>
+    <pre class="key">${esc(key)}</pre>
+    <p>Put it in the IdolyticsSettings asset of Editor and development builds. Its events show under Test, never under Live.</p>
+    <p><a href="/?project=${encodeURIComponent(id)}&amp;env=test">Open the test data</a></p></section>`);
+}
+
+interface Proj { id: string; name: string; tz_min: number; rollup_tz: number; wm_at: number; rebuild_until: number | null; created_at: number }
+const PAGES: Record<string, string> = {
+  "/": "Overview", "/retention": "Retention", "/levels": "Levels", "/economy": "Economy", "/events": "Events", "/live": "Live", "/settings": "Settings",
+};
+/** Tabs of modules that show only once the project has their events. */
+const MODULES: Record<string, "levels" | "economy"> = { "/levels": "levels", "/economy": "economy" };
+/** Pages without the filter bar. */
+const NO_FILTERS = new Set(["/live", "/settings"]);
 /** Detail pages, linked from the tables; no tab of their own. */
 const DETAIL = new Set(["/level", "/device"]);
 /** Pages where the device, event and property filters read raw events. */
@@ -103,7 +138,9 @@ const short = (day: string) => day.slice(5);
 
 export async function dashboard(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const all = (await env.DB.prepare("SELECT id, name, tz_min, rollup_tz, wm_at, rebuild_until FROM projects ORDER BY created_at").all<Proj>()).results;
+  const rows = (await env.DB.prepare("SELECT id, name, tz_min, rollup_tz, wm_at, rebuild_until, created_at FROM projects ORDER BY created_at").all<Proj>()).results;
+  // Test siblings ("<id>~test") never show in the project list.
+  const all = rows.filter((p) => !p.id.includes("~"));
   const current = all.find((p) => p.id === url.searchParams.get("project")) ?? all[0];
   const newForm = `<details${all.length ? "" : " open"}><summary>New project</summary>
     <form method="post" action="/projects"><label>Id <input name="id" required maxlength="40" placeholder="my-game"></label>
@@ -111,6 +148,11 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   if (!current) return page("idolytics", `<section><p>No projects yet. Create one to get a write key.</p>${newForm}</section>`);
 
   const now = Date.now();
+  const testEnv = url.searchParams.get("env") === "test";
+  const sibling = rows.find((p) => p.id === `${current.id}~test`);
+  /** The project whose data this page shows: the test sibling under Test. */
+  const data = testEnv ? sibling : current;
+  const pid = data?.id ?? "";
   const tz = current.tz_min;
   const today = dayOf(now, tz);
   const f = parseFilters(url.searchParams, today, RAW_PAGES.has(url.pathname));
@@ -122,9 +164,13 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     return `${path}?${q}`;
   };
   const projects = all.map((p) => `<a href="${esc(link({ project: p.id }))}"${p === current ? ' aria-current="page"' : ""}>${esc(p.name)}</a>`).join("");
+  const envSwitch = `<nav class="env" aria-label="Data"><a href="${esc(link({ env: null }))}"${testEnv ? "" : ' aria-current="page"'}>Live</a><a href="${
+    esc(link({ env: "test" }))}"${testEnv ? ' aria-current="page"' : ""}>Test</a></nav>`;
   const PAGE_ONLY = { by: null, sort: null, dir: null, level: null };
-  const tabs = Object.entries(PAGES).map(([path, label]) =>
-    `<a href="${esc(link(PAGE_ONLY, path))}"${path === url.pathname ? ' aria-current="page"' : ""}>${label}</a>`).join("");
+  const mod = pid ? await env.DB.prepare(`SELECT EXISTS (SELECT 1 FROM level_days WHERE project_id = ?1) AS levels,
+    EXISTS (SELECT 1 FROM econ_days WHERE project_id = ?1) AS economy`).bind(pid).run<{ levels: number; economy: number }>() : null;
+  const tabs = Object.entries(PAGES).filter(([path]) => !MODULES[path] || path === url.pathname || mod?.results[0]?.[MODULES[path]])
+    .map(([path, label]) => `<a href="${esc(link(PAGE_ONLY, path))}"${path === url.pathname ? ' aria-current="page"' : ""}>${label}</a>`).join("");
   const deviceHref = (id: string) => link({ ...PAGE_ONLY, event: null, prop: null, device: id }, "/device");
   const dayHref = (d: string) => link({ range: "custom", from: d, to: d });
   const zone = tzLabel(tz);
@@ -133,19 +179,34 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     <label>Reporting time zone <select name="tz">${[...new Set([...TZ_CHOICES, tz])].sort((a, b) => a - b).map((m) =>
       `<option value="${m}"${m === tz ? " selected" : ""}>${tzLabel(m)}${TZ_NAMES[m] ? ` (${TZ_NAMES[m]})` : ""}</option>`).join("")}</select></label>
     <button>Save</button></form>`;
-  const rebuilding = current.tz_min !== current.rollup_tz || current.rebuild_until !== null
+  const rebuilding = data && (data.tz_min !== data.rollup_tz || data.rebuild_until !== null)
     ? `<p class="banner">The last 90 days are being rebuilt in the background, after a time zone change or an update. Recent numbers may be incomplete for a while.</p>` : "";
-  const fresh = current.wm_at
-    ? `Rolled up to ${new Date(current.wm_at + tz * 60_000).toISOString().slice(5, 16).replace("T", " ")} ${zone}. Updates every 15 minutes.`
+  const fresh = data?.wm_at
+    ? `Rolled up to ${new Date(data.wm_at + tz * 60_000).toISOString().slice(5, 16).replace("T", " ")} ${zone}. Updates every 15 minutes.`
     : "No events rolled up yet. Numbers appear within 15 minutes of the first event.";
 
   let body: string, rowsRead: number, options = { versions: [] as string[], countries: [] as string[], platforms: ["android", "ios", "webgl", "editor"] };
-  if (url.pathname === "/retention") {
-    const r = await cohortTable(env.DB, current.id, f, today);
+  if (url.pathname === "/settings") {
+    const u = await usageToday(env.DB, new Date(now).toISOString().slice(0, 10), all.map((p) => p.id));
+    rowsRead = u.rowsRead;
+    body = settingsBody(all, rows, current, u, dailyCap(env), tzForm);
+  } else if (!data) {
+    rowsRead = 0;
+    body = `<section><p class="empty">No test key yet. Create one in <a href="${esc(link({ env: null }, "/settings"))}">Settings</a>; its events show here.</p></section>`;
+  } else if (url.pathname === "/live") {
+    const r = await live(env.DB, pid, now);
+    rowsRead = r.rowsRead;
+    body = liveBody(r, zone, tz, deviceHref);
+  } else if (url.pathname === "/economy") {
+    const r = await economy(env.DB, pid, f);
+    rowsRead = r.rowsRead;
+    body = economyBody(r, dayHref);
+  } else if (url.pathname === "/retention") {
+    const r = await cohortTable(env.DB, pid, f, today);
     rowsRead = r.rowsRead;
     body = retentionBody(r);
   } else if (url.pathname === "/levels") {
-    const r = await levelTable(env.DB, current.id, f, tz, now);
+    const r = await levelTable(env.DB, pid, f, tz, now);
     rowsRead = r.rowsRead;
     const sort = url.searchParams.get("sort") ?? "level", dir = url.searchParams.get("dir") === "desc" ? "desc" : "asc";
     body = levelsBody(r.levels, sort, dir, (over) => link(over), (l) => link({ sort: null, dir: null, level: l }, "/level"));
@@ -153,23 +214,23 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     const level = url.searchParams.get("level") ?? "";
     if (!level || level.length > 64) { rowsRead = 0; body = `<section><p class="empty">Pick a level on the Levels page.</p></section>`; }
     else {
-      const r = await levelDetail(env.DB, current.id, f, level);
+      const r = await levelDetail(env.DB, pid, f, level);
       rowsRead = r.rowsRead;
       body = levelDetailBody(level, r);
     }
   } else if (url.pathname === "/events") {
-    const r = await eventsPage(env.DB, current.id, f, tz);
+    const r = await eventsPage(env.DB, pid, f, tz);
     rowsRead = r.rowsRead;
     body = eventsBody(r, f, zone, tz, dayHref, deviceHref);
   } else if (url.pathname === "/device") {
     if (!f.device) { rowsRead = 0; body = `<section><p class="empty">Enter a device id in Filters, or open one from the Events page.</p></section>`; }
     else {
-      const r = await devicePage(env.DB, current.id, f, tz, f.device);
+      const r = await devicePage(env.DB, pid, f, tz, f.device);
       rowsRead = r.rowsRead;
       body = deviceBody(f.device, r, zone, tz);
     }
   } else {
-    const o = await overview(env.DB, current.id, f, today);
+    const o = await overview(env.DB, pid, f, today);
     rowsRead = o.rowsRead;
     options = o.options;
     body = overviewBody(o, f, dayHref, link(PAGE_ONLY, "/levels"));
@@ -183,16 +244,16 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   const rawBanner = f.raw ? `<p class="banner">Filtered on raw events${f.capped ? `, limited to the last ${RAW_MAX_DAYS} days of the range` : ""}.
     Days here are by arrival time, and raw events are kept for 90 days.</p>` : "";
 
-  const html = `<nav class="projects">${projects}${newForm}</nav>
+  const html = `<nav class="projects">${projects}${newForm}</nav>${envSwitch}
     <nav class="tabs" aria-label="Pages">${tabs}</nav>
-    ${filterBar(f, url.pathname, current.id, options)}
+    ${NO_FILTERS.has(url.pathname) ? "" : filterBar(f, url.pathname, current.id, testEnv, options)}
     ${rebuilding}${rawBanner}<p class="note">${fresh} Days run midnight to midnight in ${zone}.</p>${filterNote}${body}`;
   const res = page(`idolytics: ${current.name}`, html, 200, tzForm);
-  res.headers.set("X-D1-Rows-Read", String(rowsRead));
+  res.headers.set("X-D1-Rows-Read", String(rowsRead + (mod?.meta.rows_read ?? 0)));
   return res;
 }
 
-function filterBar(f: Filters, path: string, project: string, o: { versions: string[]; countries: string[]; platforms: string[] }) {
+function filterBar(f: Filters, path: string, project: string, testEnv: boolean, o: { versions: string[]; countries: string[]; platforms: string[] }) {
   const select = (name: string, label: string, all: string, values: string[], current: string | null) =>
     `<label>${label} <select name="${name}"><option value="">${all}</option>${[...new Set([...values, ...(current ? [current] : [])])]
       .map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label>`;
@@ -204,7 +265,7 @@ function filterBar(f: Filters, path: string, project: string, o: { versions: str
     `<label>${label} <input name="${name}" value="${esc(value)}" placeholder="${hint}" maxlength="120"></label>`;
   return `<section class="filters">
     <input type="checkbox" id="filters-open" class="toggle"><label for="filters-open" class="summary"><strong>Filters</strong> ${esc(active)}</label>
-    <form method="get" action="${esc(path)}"><input type="hidden" name="project" value="${esc(project)}">
+    <form method="get" action="${esc(path)}"><input type="hidden" name="project" value="${esc(project)}">${testEnv ? '<input type="hidden" name="env" value="test">' : ""}
       <label>Date range <select name="range">${Object.entries(RANGES).map(([k, v]) => `<option value="${k}"${k === f.range ? " selected" : ""}>${v}</option>`).join("")}
         <option value="custom"${f.range === "custom" ? " selected" : ""}>Custom</option></select></label>
       <label>From <input type="date" name="from" value="${f.range === "custom" ? f.from : ""}"></label>
@@ -219,7 +280,7 @@ function filterBar(f: Filters, path: string, project: string, o: { versions: str
       ${text("event", "Events", f.events.join(","), "level_fail,level_quit")}
       ${[0, 1, 2].map((i) => text("prop", `Property ${i + 1}`, f.props[i] ? f.props[i].join("=") : "", "key=value")).join("")}
       ${path === "/events" ? text("by", "Break down by", f.by ?? "", "props key") : ""}
-      <button>Apply</button><a class="reset" href="${esc(path)}?project=${encodeURIComponent(project)}">Reset</a>
+      <button>Apply</button><a class="reset" href="${esc(path)}?project=${encodeURIComponent(project)}${testEnv ? "&amp;env=test" : ""}">Reset</a>
     </form></section>`;
 }
 
@@ -288,7 +349,7 @@ const LEVEL_COLS: { key: string; label: string; value: (l: LevelRow) => number |
   { key: "quits", label: "Quits (inferred)", value: (l) => l.quits },
   { key: "win", label: "Win rate", value: (l) => ratio(l.wins, l.wins + l.fails), show: (l) => pct(ratio(l.wins, l.wins + l.fails)) },
   { key: "first", label: "First try win rate", value: (l) => ratio(l.first_try_wins, l.first_starts), show: (l) => pct(ratio(l.first_try_wins, l.first_starts)) },
-  { key: "apw", label: "Attempts per win", value: (l) => ratio(l.starts, l.wins), show: (l) => (l.wins ? (l.starts / l.wins).toFixed(1) : "–") },
+  { key: "apw", label: "Attempts per win", value: (l) => ratio(l.starts, l.wins), show: (l) => (l.wins && l.starts ? (l.starts / l.wins).toFixed(1) : "–") },
   { key: "duration", label: "Avg duration", value: (l) => ratio(l.duration_sum, l.duration_n), show: (l) => dur(ratio(l.duration_sum, l.duration_n)) },
   { key: "stars", label: "Avg stars", value: (l) => ratio(l.stars_sum, l.stars_n), show: (l) => avg(l.stars_sum, l.stars_n) },
   { key: "moves", label: "Avg moves left", value: (l) => ratio(l.moves_left_sum, l.moves_left_n), show: (l) => avg(l.moves_left_sum, l.moves_left_n) },
@@ -383,6 +444,83 @@ function deviceBody(id: string, r: Awaited<ReturnType<typeof devicePage>>, zone:
     ${rawTable(r.timeline, zone, tz, null, "No raw events in this range.")}</section>`;
 }
 
+const money = (v: number) => (v ? v.toFixed(2) : "–");
+const SERIES = ["s1", "s2", "s3"];
+
+function economyBody(r: Awaited<ReturnType<typeof economy>>, dayHref: (d: string) => string) {
+  const sections: string[] = [];
+  if (r.currencies.length) {
+    sections.push(`<section><h2>Currency</h2><p class="note">Amounts are the value of currency_earned and currency_spent events, by props.source and props.sink.</p>
+      <div class="scroll"><table><thead><tr><th>Currency</th><th>Earned</th><th>Spent</th></tr></thead><tbody>${r.currencies.map((c) =>
+        `<tr><td>${esc(c.currency || "(not set)")}</td><td>${num(c.earned)}</td><td>${num(c.spent)}</td></tr>`).join("")}</tbody></table></div>
+      ${r.currencies.slice(0, 3).map((c) => `<h3>${esc(c.currency || "(not set)")} per day</h3>
+        ${dayBars(r.days, [{ name: "Earned", cls: "s1", values: c.earnedByDay }, { name: "Spent", cls: "s2", values: c.spentByDay }], null, dayHref)}
+        <p class="legend"><span class="key s1"></span>Earned <span class="key s2"></span>Spent</p>
+        <div class="pair"><div><h3>Top sources</h3>${barList(c.sources)}</div><div><h3>Top sinks</h3>${barList(c.sinks)}</div></div>`).join("")}</section>`);
+  }
+  if (r.boosters.length) {
+    sections.push(`<section><h2>Boosters</h2><p class="note">Used counts booster_used, booster_bought and try_taken; offered counts booster_offered and try_offer_shown, by props.booster (props.mode for an offer without one).</p>
+      <div class="scroll"><table><thead><tr><th>Booster</th><th>Used</th><th>Offered</th></tr></thead><tbody>${r.boosters.map((b) =>
+        `<tr><td>${esc(b.booster || "(not set)")}</td><td>${b.used}</td><td>${b.offered}</td></tr>`).join("")}</tbody></table></div></section>`);
+  }
+  if (r.ads.length) {
+    const shown = r.ads.slice(0, 3);
+    sections.push(`<section><h2>Ads</h2><p class="note">ad_shown by props.format; interstitial_shown counts as interstitial and continue_watched as rewarded. Revenue is the value sent with the ad.</p>
+      ${dayBars(r.days, shown.map((a, i) => ({ name: a.format || "(not set)", cls: SERIES[i], values: a.byDay })), null, dayHref)}
+      <p class="legend">${shown.map((a, i) => `<span class="key ${SERIES[i]}"></span>${esc(a.format || "(not set)")}`).join(" ")}</p>
+      <div class="scroll"><table><thead><tr><th>Format</th><th>Shown</th><th>Revenue</th></tr></thead><tbody>${r.ads.map((a) =>
+        `<tr><td>${esc(a.format || "(not set)")}</td><td>${a.shown}</td><td>${money(a.revenue)}</td></tr>`).join("")}</tbody></table></div></section>`);
+  }
+  if (r.revenue.length) {
+    sections.push(`<section><h2>Revenue</h2><p class="note">Revenue is the value of ad_shown and iap_purchase events, per currency.
+      ARPDAU is revenue / device days (${r.deviceDays} in the range).</p>
+      <div class="scroll"><table><thead><tr><th>Currency</th><th>Revenue</th><th>Ads</th><th>In-app</th><th>ARPDAU</th></tr></thead><tbody>${r.revenue.map((m) =>
+        `<tr><td>${esc(m.currency || "(not set)")}</td><td>${money(m.total)}</td><td>${money(m.ads)}</td><td>${money(m.iap)}</td><td>${m.arpdau === null ? "–" : m.arpdau.toFixed(2)}</td></tr>`).join("")}</tbody></table></div></section>`);
+  }
+  return sections.join("") || `<section><p class="empty">No economy or ad events in this range.</p>
+    <p class="note">Send currency_earned, currency_spent, booster_used, ad_shown or iap_purchase events; see the event schema.</p></section>`;
+}
+
+function liveBody(r: Awaited<ReturnType<typeof live>>, zone: string, tz: number, deviceHref: (id: string) => string) {
+  const minutes = LIVE_MS / 60_000;
+  return `<section class="kpis"><div class="kpi" data-kpi="devices"><h3>Devices, last ${minutes} min</h3><p class="value">${r.devices}</p></div>
+    <div class="kpi" data-kpi="events"><h3>Events, last ${minutes} min</h3><p class="value">${r.events}</p></div></section>
+  <section><h2>Newest events</h2><p class="note">Raw events that arrived in the last ${minutes} minutes, newest 50. Reload the page to refresh. Times in ${zone}.</p>
+    ${rawTable(r.tail, zone, tz, deviceHref, `No events in the last ${minutes} minutes.`)}</section>`;
+}
+
+/** A bar with a warning colour from 70%. */
+const meter = (used: number, of: number) => {
+  const share = of ? Math.min(1, used / of) : 0;
+  return `<div class="meter${share >= 0.7 ? " warn" : ""}" role="meter" aria-valuemin="0" aria-valuemax="${of}" aria-valuenow="${used}"><i style="width:${Math.round(share * 100)}%"></i></div>`;
+};
+// Free plan daily limits (developers.cloudflare.com/d1/platform/limits); writes are estimated, reads are not tracked.
+const FREE_WRITES = 100_000, FREE_BYTES = 500 * 1024 * 1024;
+// About 2 row writes per event (row and arrival index) plus about 1 for the rollups.
+const WRITES_PER_EVENT = 3;
+
+function settingsBody(list: Proj[], rows: Proj[], current: Proj, u: Awaited<ReturnType<typeof usageToday>>, cap: number, tzForm: string) {
+  const has = new Set(rows.map((p) => p.id));
+  const used = u.events.get(current.id) ?? 0, usedTest = u.events.get(`${current.id}~test`) ?? 0;
+  const total = [...u.events.values()].reduce((t, n) => t + n, 0);
+  const writes = total * WRITES_PER_EVENT;
+  const projects = list.map((p) => `<tr><td>${esc(p.name)}</td><td>${esc(p.id)}</td><td>${tzLabel(p.tz_min)}</td><td>${u.events.get(p.id) ?? 0}</td>
+    <td>${has.has(`${p.id}~test`) ? u.events.get(`${p.id}~test`) ?? 0 : "No test key"}</td></tr>`).join("");
+  const testKey = has.has(`${current.id}~test`);
+  return `<section><h2>Projects</h2><div class="scroll"><table><thead><tr><th>Name</th><th>Id</th><th>Time zone</th><th>Live events today</th><th>Test events today</th></tr></thead>
+    <tbody>${projects}</tbody></table></div><p class="note">Events today count from UTC midnight, as the daily cap does.</p></section>
+  <section><h2>${esc(current.name)}</h2>
+    ${tzForm}
+    <h3>Daily event cap</h3><p>${used} of ${cap} events today${usedTest ? `, and ${usedTest} of ${cap} on the test key` : ""}.</p>${meter(used, cap)}
+    <p class="note">Each key's project has its own cap. Over it, ingest answers 429 until UTC midnight and the SDK retries later.</p>
+    <h3>Test key</h3><p class="note">${testKey ? "A test key exists. Rotating it stops the old one at once." : "Test builds get their own key; their events show under Test, never under Live."}</p>
+    <form method="post" action="/settings/test-key"><input type="hidden" name="project" value="${esc(current.id)}"><button>${testKey ? "Rotate test key" : "Create test key"}</button></form></section>
+  <section><h2>D1 usage estimate</h2>
+    <h3>Estimated D1 rows written today</h3><p>About ${num(writes)} of ${num(FREE_WRITES)} on the free plan (${total} events × ${WRITES_PER_EVENT}).</p>${meter(writes, FREE_WRITES)}
+    ${u.bytes === null ? "" : `<h3>Database size</h3><p>${(u.bytes / 1024 / 1024).toFixed(1)} MB of 500 MB.</p>${meter(u.bytes, FREE_BYTES)}`}
+    <p class="note">Rows read are not tracked here; each page reports its own in the X-D1-Rows-Read header. Exact numbers are in the Cloudflare dashboard under D1, Metrics.</p></section>`;
+}
+
 function page(title: string, body: string, status = 200, tools = ""): Response {
   const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${esc(title)}</title><style>${CSS}</style></head><body><header><h1>${esc(title)}</h1>${tools}</header><main>${body}</main></body></html>`;
@@ -439,6 +577,10 @@ th:first-child,td:first-child{text-align:left}th{color:var(--muted);font-weight:
 .heat td,.heat th{padding:4px 6px;font-size:12px;text-align:center;border:1px solid var(--surface)}
 .heat th[scope=row]{position:sticky;left:0;background:var(--surface);text-align:left}
 .heat .incomplete{color:var(--muted);background:repeating-linear-gradient(135deg,var(--surface) 0 4px,var(--bg) 4px 8px)}
+nav.env{gap:0;margin:-4px 0 12px}nav.env a{border-radius:0;padding:4px 12px}nav.env a:first-child{border-radius:999px 0 0 999px}nav.env a:last-child{border-radius:0 999px 999px 0;border-left:0}
+.meter{height:10px;border-radius:5px;background:var(--line);margin:4px 0 12px;max-width:420px}.meter i{display:block;height:100%;border-radius:5px;background:var(--s1)}
+.meter.warn i{background:var(--s2)}
+.pair{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:12px}h3{margin-top:12px}
 .funnel{list-style:none;margin:0;padding:0;font-size:14px}.funnel li{margin:0 0 6px}
 .funnel i{display:block;height:8px;border-radius:4px;background:var(--s1);margin-top:2px;min-width:2px}
 .levels th a{color:inherit;text-decoration:none}
