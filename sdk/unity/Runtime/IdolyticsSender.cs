@@ -40,7 +40,7 @@ namespace IdolyticsSdk
 
         void Update()
         {
-            if (Idolytics.Dirty) Idolytics.SaveThrottled();
+            if (Idolytics.Dirty || Idolytics.PlayOpen) Idolytics.SaveThrottled();
         }
 
         public void Flush()

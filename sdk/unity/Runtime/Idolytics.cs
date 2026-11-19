@@ -9,9 +9,9 @@ namespace IdolyticsSdk
     /// The SDK entry point. Track queues an event (persisted in PlayerPrefs); a hidden sender
     /// posts batches to the server once settings are known.
     /// </summary>
-    public static class Idolytics
+    public static partial class Idolytics
     {
-        internal const string SdkVersion = "unity/0.1.2";
+        internal const string SdkVersion = "unity/0.2.0";
         const string InstallIdKey = "idolytics.install_id";
         const string QueueKey = "idolytics.queue";
         const float SaveInterval = 2;
@@ -53,6 +53,7 @@ namespace IdolyticsSdk
                 {
                     queue = EventQueue.Restore(PlayerPrefs.GetString(QueueKey), 1000, out bool unreadable);
                     if (unreadable) Debug.LogWarning("[idolytics] The saved event queue was unreadable and was discarded.");
+                    RecoverOpenPlay();
                 }
                 return queue;
             }
@@ -115,6 +116,7 @@ namespace IdolyticsSdk
         internal static void Save()
         {
             PlayerPrefs.SetString(QueueKey, Queue.Serialize());
+            SavePlay();
             PlayerPrefs.Save();
             lastSave = Time.realtimeSinceStartup;
             Dirty = false;
@@ -178,12 +180,13 @@ namespace IdolyticsSdk
 
         // Statics survive play mode in the Editor when domain reload is off.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
-        static void ResetStatics()
+        internal static void ResetStatics()
         {
             Settings = null;
             sender = null;
             queue = null;
             SessionId = null;
+            openPlay = null;
             lastSave = float.NegativeInfinity;
             Dirty = false;
         }

@@ -4,14 +4,15 @@ using UnityEditor.PackageManager;
 
 public class SampleCopyTests
 {
-    // Assets/NinjaSmashCheck holds a copy of the sample because Unity never compiles Samples~.
-    // This keeps the copy honest: copy the sample again when it changes.
-    [Test]
-    public void NinjaSmashAdapterCopyMatchesSample()
+    // Assets/*Check folders hold copies of the samples because Unity never compiles Samples~.
+    // This keeps the copies honest: copy a sample again when it changes.
+    [TestCase("NinjaSmash/IdolyticsAnalyticsService.cs", "NinjaSmashCheck")]
+    [TestCase("MatchBattle/MatchBattleAnalytics.cs", "MatchBattleCheck")]
+    public void SampleCopyMatchesSample(string sample, string copyFolder)
     {
         string package = PackageInfo.FindForAssetPath("Packages/com.idolytics.unity").resolvedPath;
-        string sample = File.ReadAllText(Path.Combine(package, "Samples~/NinjaSmash/IdolyticsAnalyticsService.cs"));
-        string copy = File.ReadAllText("Assets/NinjaSmashCheck/IdolyticsAnalyticsService.cs");
-        Assert.AreEqual(sample, copy, "Copy Samples~/NinjaSmash/IdolyticsAnalyticsService.cs to Assets/NinjaSmashCheck/.");
+        string original = File.ReadAllText(Path.Combine(package, "Samples~", sample));
+        string copy = File.ReadAllText(Path.Combine("Assets", copyFolder, Path.GetFileName(sample)));
+        Assert.AreEqual(original, copy, $"Copy Samples~/{sample} to Assets/{copyFolder}/.");
     }
 }
