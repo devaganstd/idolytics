@@ -124,6 +124,19 @@ The Economy page also counts `booster_bought` and the Ninja Smash event `try_tak
 
 Ninja Smash's `interstitial_shown` and `continue_watched` count as `ad_shown` with the format `interstitial` and `rewarded`. Revenue and ARPDAU show only for events that send `value` with a `currency`. Each of these events is rolled up into one row per day, name, currency, detail, version and platform, so keep sources, sinks, boosters and products to a short fixed list.
 
+## Plays, progress and steps (SDK 0.2.0)
+
+A play is one level, match, run or round. `level_*` events are read as plays of kind `level`, so games on SDK 0.1 keep working.
+
+| Event | Fields |
+|---|---|
+| `play_start` | `level` (the play key: a level, a board or a stage), `attempt`, `props.kind` (`level`, `match`, `run`, `round`), `props.mode`, `props.difficulty`, `props.opponent` |
+| `play_end` | the same keys, plus `props.result` (`win`, `loss`, `draw`, `quit`, `abandon`), `props.reason`, `duration_ms`, `value` (the score) |
+| `progress` | `props.track` (such as `trophies`), `value` (the new value), `props.delta` |
+| `step` | `props.flow`, `props.step` (an integer from 0), `props.step_id`, `duration_ms` |
+
+The game profile declares which props keys are dimensions; a dimension marked `multi`, such as a deck, holds up to 10 comma-separated values, and each counts the play once. Each dimension keeps at most 200 values; later ones count as `other`. Tracks are counted by their milestones only. `tutorial_begin`, `tutorial_step` (`props.step`) and `tutorial_complete` are the flow `tutorial`.
+
 ## Custom events
 
 Any name that follows the name rule is accepted and shows in the latest events list. Use snake case with the verb last, such as `chest_opened`. Put `level` on an event that happens inside a level so it can be linked to that level later.

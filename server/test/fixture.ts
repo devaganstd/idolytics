@@ -57,3 +57,71 @@ export async function seedEconomy() {
   await e("continue_watched", "d1", at(0, 10, 10), { level: "1" });
   await e("iap_purchase", "d2", at(0, 11, 9), { value: 0.99, currency: "USD", props: { product: "starter" } });
 }
+
+const DECK_A = "burst,canon,meteor,pierce,frost,wall,burst,canon"; // 8 cards, 6 distinct
+const DECK_B = "burst,canon,meteor,pierce,frost,burst,canon,meteor"; // 8 cards, 5 distinct
+
+/**
+ * Hand counted Hex Battle Ground shaped data, as SDK 0.2.0 sends it. m1 (android) and m2 (ios) install on 11-01.
+ * Matches against a bot, all mode normal (board, difficulty, deck, result, score):
+ *   1 m1 11-01 hourglass easy   A win     0.9    4 m2 11-01 ring   easy   B win     0.8
+ *   2 m1 11-01 hourglass normal A loss    0.4    5 m2 11-01 delta  hard   B abandon
+ *   3 m1 11-01 ring      hard   A draw    0.5    6 m2 11-02 delta  normal B loss    0.3
+ *   7 m1 11-02 hourglass easy   A, started and never ended: an inferred quit.
+ * Trophies (milestones 300, 800, 1500): m1 330 then 310 on 11-01, 820 on 11-02; m2 120 on 11-01, 90 on 11-02.
+ * Arena (2, 3, 4): m1 2 on 11-01, 3 on 11-02. Flow tutorial1: m1 steps 1, 2, 3 (5 s, 8 s, 4 s), m2 steps 1, 2 (7 s, 10 s).
+ * Tutorial: m2 tutorial_begin, tutorial_step 1, tutorial_complete.
+ */
+export async function seedMatch() {
+  const ios = { platform: "ios", country: "US" };
+  const e = (name: string, device: string, ts: number, more: Record<string, unknown> = {}) =>
+    raw({ name, device, session: device + "s" + Math.floor((ts - D1) / DAY), ts, ...(device === "m2" ? ios : {}), ...more });
+  let attempt = 0;
+  const match = async (device: string, ts: number, board: string, difficulty: string, deck: string, result: string | null, score?: number) => {
+    const props = { kind: "match", mode: "normal", difficulty, opponent: "bot", deck };
+    const a = ++attempt;
+    await e("play_start", device, ts, { level: board, attempt: a, props });
+    if (result) await e("play_end", device, ts + 2 * MIN, { level: board, attempt: a, duration: 60_000, value: score, props: { ...props, result } });
+  };
+  await match("m1", at(0, 10), "hourglass", "easy", DECK_A, "win", 0.9);
+  await match("m1", at(0, 10, 5), "hourglass", "normal", DECK_A, "loss", 0.4);
+  await match("m1", at(0, 10, 10), "ring", "hard", DECK_A, "draw", 0.5);
+  await match("m2", at(0, 12), "ring", "easy", DECK_B, "win", 0.8);
+  await match("m2", at(0, 12, 5), "delta", "hard", DECK_B, "abandon");
+  await match("m2", at(1, 12), "delta", "normal", DECK_B, "loss", 0.3);
+  await match("m1", at(1, 10), "hourglass", "easy", DECK_A, null);
+  const progress = (device: string, ts: number, track: string, value: number) => e("progress", device, ts, { value, props: { track } });
+  await progress("m1", at(0, 10, 3), "trophies", 330);
+  await progress("m1", at(0, 10, 8), "trophies", 310);
+  await progress("m1", at(0, 10, 9), "arena", 2);
+  await progress("m1", at(1, 10, 1), "trophies", 820);
+  await progress("m1", at(1, 10, 2), "arena", 3);
+  await progress("m2", at(0, 12, 3), "trophies", 120);
+  await progress("m2", at(1, 12, 3), "trophies", 90);
+  const step = (device: string, ts: number, n: number, duration: number) =>
+    e("step", device, ts, { duration, props: { flow: "tutorial1", step: n, step_id: `s${n}` } });
+  await step("m1", at(0, 9, 1), 1, 5000);
+  await step("m1", at(0, 9, 2), 2, 8000);
+  await step("m1", at(0, 9, 3), 3, 4000);
+  await step("m2", at(0, 11, 1), 1, 7000);
+  await step("m2", at(0, 11, 2), 2, 10_000);
+  await e("tutorial_begin", "m2", at(0, 11, 3), { props: { tutorial: "basics" } });
+  await e("tutorial_step", "m2", at(0, 11, 4), { props: { tutorial: "basics", step: 1 } });
+  await e("tutorial_complete", "m2", at(0, 11, 5), { duration: 120_000, props: { tutorial: "basics" } });
+}
+
+/** The fixture of seed() as SDK 0.2.0 would send it: play_start and play_end with kind level. */
+export async function seedAsPlays() {
+  const map: Record<string, [string, string | null]> = {
+    level_start: ["play_start", null], level_complete: ["play_end", "win"], level_fail: ["play_end", "loss"], level_quit: ["play_end", "quit"],
+  };
+  const { rows } = await import("./helpers");
+  await seed();
+  const all = await rows("SELECT event_id, name, props FROM events WHERE name LIKE 'level_%'");
+  const { env } = await import("cloudflare:workers");
+  for (const r of all) {
+    const [name, result] = map[r.name as string];
+    const props = { ...(r.props ? JSON.parse(r.props as string) : {}), kind: "level", ...(result ? { result } : {}) };
+    await env.DB.prepare("UPDATE events SET name = ?, props = ? WHERE event_id = ?").bind(name, JSON.stringify(props), r.event_id).run();
+  }
+}

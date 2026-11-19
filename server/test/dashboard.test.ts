@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { parseTz, tzLabel } from "../src/dashboard";
-import { at, NOW, seed, seedEconomy } from "./fixture";
+import { at, NOW, seed, seedAsPlays, seedEconomy, seedMatch } from "./fixture";
 import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
 const AUTH = { Authorization: "Basic " + btoa("admin:test-admin-key") };
@@ -349,5 +349,117 @@ describe("reporting time zone", () => {
     expect((await save("project=demo&tz=60", "https://evil.example")).status).toBe(403);
     expect((await save("project=demo&tz=60&back=//evil.example")).headers.get("Location")).toBe("/");
     expect((await save("project=demo&tz=60&back=%2F%09%2Fevil.example")).headers.get("Location")).toBe("/");
+  });
+});
+
+describe("game profiles: plays, progress, content and flows", () => {
+  beforeEach(async () => {
+    await createProject();
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(at(20, 12));
+  });
+  afterEach(() => vi.useRealTimers());
+  const section = (html: string, heading: string) => html.slice(html.indexOf(`<h2>${heading}`));
+
+  it("keeps the 0.2.1 Levels numbers for Ninja Smash shaped data and hides the new pages", async () => {
+    await seed();
+    await rollUp(NOW);
+    const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(html).toMatch(/>Levels<\/a>/);
+    for (const tab of ["Progress", "Content", "Flows"]) expect(html).not.toMatch(new RegExp(`>${tab}</a>`));
+  });
+
+  it("shows the same Levels numbers when the game sends play_start and play_end", async () => {
+    await seedAsPlays();
+    await rollUp(NOW);
+    const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    // The same through the raw path.
+    const raw = await (await get(`/levels?project=demo&${RANGE}&prop=kind%3Dlevel`)).text();
+    expect(cells(raw, "1")?.slice(0, 6)).toEqual(["1", "3", "2", "2", "1", "0"]);
+  });
+
+  it("labels the plays page from the profile and adds draws, abandons and breakdowns", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    for (const tab of ["Matches", "Progress", "Content", "Flows"]) expect(html).toMatch(new RegExp(`>${tab}</a>`));
+    expect(html).toContain("<h2>Matches</h2>");
+    expect(cells(html, "Board ↑")).toEqual(["Board", "Starts", "Players", "Wins", "Losses", "Quits (inferred)", "Draws", "Abandons",
+      "Win rate", "First try win rate", "Attempts per win", "Avg duration"].map((c, i) => (i === 0 ? c + " ↑" : c)));
+    expect(cells(html, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s"]);
+    expect(cells(html, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s"]);
+    expect(cells(html, "delta")).toEqual(["delta", "2", "1", "0", "1", "0", "0", "1", "0%", "–", "–", "1m 00s"]);
+    const diff = section(html, "By difficulty");
+    expect(cells(diff, "easy")).toEqual(["easy", "3", "2", "0", "1", "0", "0", "100%"]);
+    expect(cells(diff, "normal")).toEqual(["normal", "2", "0", "2", "0", "0", "0", "0%"]);
+    expect(cells(diff, "hard")).toEqual(["hard", "2", "0", "0", "0", "1", "1", "–"]);
+    expect(cells(section(html, "By mode"), "normal")).toEqual(["normal", "7", "2", "2", "1", "1", "1", "50%"]);
+    expect(cells(section(html, "By opponent"), "bot")).toEqual(["bot", "6", "2", "2", "1", "50%"]);
+    expect(html).not.toContain("Progression"); // the level funnel is for levels only
+  });
+
+  it("shows pick rate and win rate per dimension value", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const res = await get(`/content?project=demo&${RANGE}&dim=deck`);
+    expect(Number(res.headers.get("X-D1-Rows-Read"))).toBeGreaterThan(0);
+    const html = await res.text();
+    expect(html).toMatch(/aria-current="page"[^>]*>Card</);
+    expect(cells(html, "burst")).toEqual(["burst", "6", "100%", "3", "2", "2", "1", "50%", "0.58"]); // player days: m1 11-01, m2 11-01 and 11-02
+    expect(cells(html, "wall")).toEqual(["wall", "3", "50%", "1", "1", "1", "1", "50%", "0.60"]);
+    expect(html.indexOf(">burst<")).toBeLessThan(html.indexOf(">wall<"));
+    const diff = await (await get(`/content?project=demo&${RANGE}&dim=difficulty`)).text();
+    expect(cells(diff, "easy")).toEqual(["easy", "2", "33%", "2", "2", "0", "0", "100%", "0.85"]);
+  });
+
+  it("shows players along each track, time to each milestone and where they stop", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const html = await (await get(`/progress?project=demo&${RANGE}`)).text();
+    const trophies = section(html, "Trophies");
+    expect(cells(trophies, "Below 300")).toEqual(["Below 300", "2", "–", "–", "–"]);
+    expect(cells(trophies, "300+")).toEqual(["300+", "1", "1", "0.0", "0"]);
+    expect(cells(trophies, "800+")).toEqual(["800+", "1", "1", "1.0", "1"]);
+    expect(cells(trophies, "1500+")).toEqual(["1500+", "0", "0", "–", "0"]);
+    expect(cells(section(html, "Arena"), "3+")).toEqual(["3+", "1", "1", "1.0", "1"]);
+  });
+
+  it("shows a step funnel per flow, with tutorial events as the flow tutorial", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const html = await (await get(`/flows?project=demo&${RANGE}`)).text();
+    const t1 = section(html, "tutorial1");
+    expect(cells(t1, "1")).toEqual(["1", "2", "–", "6s"]);
+    expect(cells(t1, "2")).toEqual(["2", "2", "0%", "9s"]);
+    expect(cells(t1, "3")).toEqual(["3", "1", "50%", "4s"]);
+    const t = section(html, "tutorial<");
+    expect(cells(t, "Begin")).toEqual(["Begin", "1", "–", "–"]);
+    expect(cells(t, "Complete")).toEqual(["Complete", "1", "0%", "2m 00s"]);
+  });
+
+  it("shows the detected preset and saves a profile, which rebuilds the rollups", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    vi.setSystemTime(NOW); // suggestions read the last 7 days of raw events
+    const html = await (await get("/settings?project=demo")).text();
+    expect(html).toContain("Detected: match_battle");
+    expect(html).toMatch(/Suggested dimensions:[^<]*deck/);
+    const save = (body: string, origin = BASE) => exports.default.fetch(new Request(`${BASE}/settings/profile`, {
+      method: "POST", redirect: "manual", headers: { ...AUTH, Origin: origin, "Content-Type": "application/x-www-form-urlencoded" }, body,
+    }));
+    expect((await save("project=demo&preset=run_roguelike")).status).toBe(303);
+    const p = await env.DB.prepare("SELECT profile, tz_min, rollup_tz FROM projects").first<{ profile: string; tz_min: number; rollup_tz: number }>();
+    expect(JSON.parse(p!.profile)).toMatchObject({ preset: "run_roguelike", play_label: "Run" });
+    expect(p!.rollup_tz).not.toBe(p!.tz_min);
+    const custom = JSON.stringify({ preset: "match_battle", play_label: "Duel", play_kinds: ["match"], dimensions: [{ key: "deck", multi: true }] });
+    expect((await save(`project=demo&profile=${encodeURIComponent(custom)}`)).status).toBe(303);
+    expect(JSON.parse((await env.DB.prepare("SELECT profile FROM projects").first<{ profile: string }>())!.profile)).toMatchObject({ play_label: "Duel" });
+    expect((await save("project=demo&profile=%7Bnope")).status).toBe(400);
+    expect((await save(`project=demo&profile=${encodeURIComponent(JSON.stringify({ dimensions: "x" }))}`)).status).toBe(400);
+    expect((await save("project=demo&preset=run_roguelike", "https://evil.example")).status).toBe(403);
   });
 });

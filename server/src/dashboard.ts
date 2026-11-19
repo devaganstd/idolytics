@@ -1,11 +1,13 @@
 import { esc } from "./html";
 import { dailyCap } from "./ingest";
 import { newWriteKey, safeEqual, sha256Hex } from "./keys";
+import { effectiveProfile, parseProfile, plural, PRESETS, type Profile } from "./profile";
 import {
-  cohortTable, devicePage, economy, eventsPage, type Filters, type Kpis, levelDetail, type LevelRow, levelTable, live, LIVE_MS, overview,
-  parseFilters, RANGES, RAW_MAX_DAYS, type TailRow, usageToday,
+  cohortTable, contentPage, devicePage, type DimRow, economy, eventsPage, type Filters, flowsPage, type Kpis, levelDetail, type LevelRow, levelTable,
+  live, LIVE_MS, overview, parseFilters, progressPage, RANGES, RAW_MAX_DAYS, type Results, type StepRow, suggestDims, type TailRow, type TrackRow,
+  usageToday,
 } from "./queries";
-import { dayOf, QUIT_AFTER_MS } from "./rollup";
+import { dayOf, QUIT_AFTER_MS, STEP_DONE } from "./rollup";
 import { barList, dayBars } from "./svg";
 
 const HEADERS = {
@@ -87,6 +89,28 @@ export async function setTimezone(request: Request, env: Env): Promise<Response>
 }
 
 /**
+ * POST /settings/profile: saves a project's game profile, from a preset or as JSON. The cron then rebuilds the
+ * last 90 days with it, for the project and its test sibling.
+ */
+export async function setProfile(request: Request, env: Env): Promise<Response> {
+  if (!sameOrigin(request)) return new Response("Cross origin form refused", { status: 403 });
+  const form = await request.formData();
+  const id = String(form.get("project") ?? "");
+  const preset = String(form.get("preset") ?? ""), json = String(form.get("profile") ?? "").trim();
+  let profile: Profile;
+  try {
+    if (preset) profile = Object.hasOwn(PRESETS, preset) ? PRESETS[preset] : parseProfile(null);
+    else if (json.length > 4000) throw new Error("at most 4000 characters");
+    else profile = parseProfile(JSON.parse(json));
+  } catch (e) {
+    return new Response(`Profile refused: ${(e as Error).message}`, { status: 400 });
+  }
+  await env.DB.prepare("UPDATE projects SET profile = ?1, rollup_tz = tz_min + 100000 WHERE id IN (?2, ?2 || '~test')")
+    .bind(JSON.stringify(profile), id).run();
+  return new Response(null, { status: 303, headers: { Location: `/settings?project=${encodeURIComponent(id)}` } });
+}
+
+/**
  * POST /settings/test-key: creates or rotates a project's test key. Test events go to the hidden sibling
  * project "<id>~test", created here on the first key with the parent's time zone. The key is shown once.
  */
@@ -98,8 +122,8 @@ export async function createTestKey(request: Request, env: Env): Promise<Respons
   const key = newWriteKey();
   await env.DB.batch([
     // write_key_hash is unused for siblings since keys came in; it only has to be unique.
-    env.DB.prepare(`INSERT OR IGNORE INTO projects (id, name, created_at, write_key_hash, tz_min, rollup_tz)
-      SELECT id || '~test', name || ' (test)', ?2, 'sibling:' || id, tz_min, tz_min FROM projects WHERE id = ?1`).bind(id, Date.now()),
+    env.DB.prepare(`INSERT OR IGNORE INTO projects (id, name, created_at, write_key_hash, tz_min, rollup_tz, profile)
+      SELECT id || '~test', name || ' (test)', ?2, 'sibling:' || id, tz_min, tz_min, profile FROM projects WHERE id = ?1`).bind(id, Date.now()),
     env.DB.prepare("DELETE FROM keys WHERE project_id = ? AND env = 'test'").bind(id),
     env.DB.prepare("INSERT INTO keys (key_hash, project_id, env) VALUES (?, ?, 'test')").bind(await sha256Hex(key), id),
   ]);
@@ -110,12 +134,17 @@ export async function createTestKey(request: Request, env: Env): Promise<Respons
     <p><a href="/?project=${encodeURIComponent(id)}&amp;env=test">Open the test data</a></p></section>`);
 }
 
-interface Proj { id: string; name: string; tz_min: number; rollup_tz: number; wm_at: number; rebuild_until: number | null; created_at: number }
+interface Proj {
+  id: string; name: string; tz_min: number; rollup_tz: number; wm_at: number; rebuild_until: number | null; created_at: number;
+  profile: string | null; profile_detected: string | null;
+}
 const PAGES: Record<string, string> = {
-  "/": "Overview", "/retention": "Retention", "/levels": "Levels", "/economy": "Economy", "/events": "Events", "/live": "Live", "/settings": "Settings",
+  "/": "Overview", "/retention": "Retention", "/levels": "Levels", "/progress": "Progress", "/content": "Content", "/flows": "Flows",
+  "/economy": "Economy", "/events": "Events", "/live": "Live", "/settings": "Settings",
 };
+type Module = "levels" | "progress" | "content" | "flows" | "economy";
 /** Tabs of modules that show only once the project has their events. */
-const MODULES: Record<string, "levels" | "economy"> = { "/levels": "levels", "/economy": "economy" };
+const MODULES: Record<string, Module> = { "/levels": "levels", "/progress": "progress", "/content": "content", "/flows": "flows", "/economy": "economy" };
 /** Pages without the filter bar. */
 const NO_FILTERS = new Set(["/live", "/settings"]);
 /** Detail pages, linked from the tables; no tab of their own. */
@@ -138,7 +167,9 @@ const short = (day: string) => day.slice(5);
 
 export async function dashboard(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
-  const rows = (await env.DB.prepare("SELECT id, name, tz_min, rollup_tz, wm_at, rebuild_until, created_at FROM projects ORDER BY created_at").all<Proj>()).results;
+  const rows = (await env.DB.prepare(
+    "SELECT id, name, tz_min, rollup_tz, wm_at, rebuild_until, created_at, profile, profile_detected FROM projects ORDER BY created_at",
+  ).all<Proj>()).results;
   // Test siblings ("<id>~test") never show in the project list.
   const all = rows.filter((p) => !p.id.includes("~"));
   const current = all.find((p) => p.id === url.searchParams.get("project")) ?? all[0];
@@ -155,6 +186,10 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   const pid = data?.id ?? "";
   const tz = current.tz_min;
   const today = dayOf(now, tz);
+  // The test sibling reads with its project's profile.
+  const profile = effectiveProfile(current.profile, current.profile_detected);
+  const kinds = profile ? JSON.stringify(profile.play_kinds) : null;
+  const playLabel = profile?.play_label ?? "Level";
   const f = parseFilters(url.searchParams, today, RAW_PAGES.has(url.pathname));
   /** This page's URL with some params changed; null removes one. */
   const link = (over: Record<string, string | null>, path = url.pathname) => {
@@ -166,11 +201,15 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   const projects = all.map((p) => `<a href="${esc(link({ project: p.id }))}"${p === current ? ' aria-current="page"' : ""}>${esc(p.name)}</a>`).join("");
   const envSwitch = `<nav class="env" aria-label="Data"><a href="${esc(link({ env: null }))}"${testEnv ? "" : ' aria-current="page"'}>Live</a><a href="${
     esc(link({ env: "test" }))}"${testEnv ? ' aria-current="page"' : ""}>Test</a></nav>`;
-  const PAGE_ONLY = { by: null, sort: null, dir: null, level: null };
-  const mod = pid ? await env.DB.prepare(`SELECT EXISTS (SELECT 1 FROM level_days WHERE project_id = ?1) AS levels,
-    EXISTS (SELECT 1 FROM econ_days WHERE project_id = ?1) AS economy`).bind(pid).run<{ levels: number; economy: number }>() : null;
+  const PAGE_ONLY = { by: null, sort: null, dir: null, level: null, dim: null };
+  const mod = pid ? await env.DB.prepare(`SELECT EXISTS (SELECT 1 FROM play_days WHERE project_id = ?1) AS levels,
+    EXISTS (SELECT 1 FROM track_days WHERE project_id = ?1) AS progress,
+    EXISTS (SELECT 1 FROM dim_days WHERE project_id = ?1 AND dim > '') AS content,
+    EXISTS (SELECT 1 FROM step_days WHERE project_id = ?1) AS flows,
+    EXISTS (SELECT 1 FROM econ_days WHERE project_id = ?1) AS economy`).bind(pid).run<Record<Module, number>>() : null;
   const tabs = Object.entries(PAGES).filter(([path]) => !MODULES[path] || path === url.pathname || mod?.results[0]?.[MODULES[path]])
-    .map(([path, label]) => `<a href="${esc(link(PAGE_ONLY, path))}"${path === url.pathname ? ' aria-current="page"' : ""}>${label}</a>`).join("");
+    .map(([path, label]) => `<a href="${esc(link(PAGE_ONLY, path))}"${path === url.pathname ? ' aria-current="page"' : ""}>${
+      path === "/levels" ? esc(plural(playLabel)) : label}</a>`).join("");
   const deviceHref = (id: string) => link({ ...PAGE_ONLY, event: null, prop: null, device: id }, "/device");
   const dayHref = (d: string) => link({ range: "custom", from: d, to: d });
   const zone = tzLabel(tz);
@@ -188,8 +227,9 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
   let body: string, rowsRead: number, options = { versions: [] as string[], countries: [] as string[], platforms: ["android", "ios", "webgl", "editor"] };
   if (url.pathname === "/settings") {
     const u = await usageToday(env.DB, new Date(now).toISOString().slice(0, 10), all.map((p) => p.id));
-    rowsRead = u.rowsRead;
-    body = settingsBody(all, rows, current, u, dailyCap(env), tzForm);
+    const sug = await suggestDims(env.DB, current.id, now);
+    rowsRead = u.rowsRead + sug.rowsRead;
+    body = settingsBody(all, rows, current, u, dailyCap(env), tzForm) + profileBody(current, profile, sug.keys);
   } else if (!data) {
     rowsRead = 0;
     body = `<section><p class="empty">No test key yet. Create one in <a href="${esc(link({ env: null }, "/settings"))}">Settings</a>; its events show here.</p></section>`;
@@ -206,15 +246,35 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     rowsRead = r.rowsRead;
     body = retentionBody(r);
   } else if (url.pathname === "/levels") {
-    const r = await levelTable(env.DB, pid, f, tz, now);
+    const r = await levelTable(env.DB, pid, f, tz, now, kinds);
     rowsRead = r.rowsRead;
     const sort = url.searchParams.get("sort") ?? "level", dir = url.searchParams.get("dir") === "desc" ? "desc" : "asc";
-    body = levelsBody(r.levels, sort, dir, (over) => link(over), (l) => link({ sort: null, dir: null, level: l }, "/level"));
+    const keyLabel = profile?.dimensions.find((d) => d.key === "level")?.label ?? playLabel;
+    body = levelsBody(r.levels, sort, dir, (over) => link(over), (l) => link({ sort: null, dir: null, level: l }, "/level"),
+      { label: playLabel, keyLabel, funnel: !profile || profile.play_kinds.includes("level") }) + resultsBody(r);
+  } else if (url.pathname === "/content") {
+    const dims = profile?.dimensions ?? [];
+    const dim = dims.find((d) => d.key === url.searchParams.get("dim")) ?? dims[0];
+    if (!dim) { rowsRead = 0; body = `<section><p class="empty">Declare dimensions in the game profile in Settings.</p></section>`; }
+    else {
+      const r = await contentPage(env.DB, pid, f, kinds, dim.key);
+      rowsRead = r.rowsRead;
+      const nav = dims.map((d) => `<a href="${esc(link({ dim: d.key }))}"${d === dim ? ' aria-current="page"' : ""}>${esc(d.label ?? d.key)}</a>`).join("");
+      body = `<nav class="sub" aria-label="Dimensions">${nav}</nav>${contentBody(dim.label ?? dim.key, r.values, r.plays)}`;
+    }
+  } else if (url.pathname === "/progress") {
+    const r = await progressPage(env.DB, pid, f);
+    rowsRead = r.rowsRead;
+    body = progressBody(profile, r.rows);
+  } else if (url.pathname === "/flows") {
+    const r = await flowsPage(env.DB, pid, f);
+    rowsRead = r.rowsRead;
+    body = flowsBody(r.rows);
   } else if (url.pathname === "/level") {
     const level = url.searchParams.get("level") ?? "";
     if (!level || level.length > 64) { rowsRead = 0; body = `<section><p class="empty">Pick a level on the Levels page.</p></section>`; }
     else {
-      const r = await levelDetail(env.DB, pid, f, level);
+      const r = await levelDetail(env.DB, pid, f, level, kinds);
       rowsRead = r.rowsRead;
       body = levelDetailBody(level, r);
     }
@@ -230,7 +290,7 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
       body = deviceBody(f.device, r, zone, tz);
     }
   } else {
-    const o = await overview(env.DB, pid, f, today);
+    const o = await overview(env.DB, pid, f, today, kinds);
     rowsRead = o.rowsRead;
     options = o.options;
     body = overviewBody(o, f, dayHref, link(PAGE_ONLY, "/levels"));
@@ -341,12 +401,15 @@ function retentionBody(r: Awaited<ReturnType<typeof cohortTable>>) {
 
 const ratio = (a: number, b: number) => (b ? a / b : null);
 const avg = (sum: number, n: number) => (n ? (sum / n).toFixed(1) : "–");
-const LEVEL_COLS: { key: string; label: string; value: (l: LevelRow) => number | null; show?: (l: LevelRow) => string }[] = [
+type Col = { key: string; label: string; value: (l: LevelRow) => number | null; show?: (l: LevelRow) => string };
+const LEVEL_COLS: Col[] = [
   { key: "starts", label: "Starts", value: (l) => l.starts },
   { key: "players", label: "Players", value: (l) => l.players },
   { key: "wins", label: "Wins", value: (l) => l.wins },
   { key: "fails", label: "Fails", value: (l) => l.fails },
   { key: "quits", label: "Quits (inferred)", value: (l) => l.quits },
+  { key: "draws", label: "Draws", value: (l) => l.draws },
+  { key: "abandons", label: "Abandons", value: (l) => l.abandons },
   { key: "win", label: "Win rate", value: (l) => ratio(l.wins, l.wins + l.fails), show: (l) => pct(ratio(l.wins, l.wins + l.fails)) },
   { key: "first", label: "First try win rate", value: (l) => ratio(l.first_try_wins, l.first_starts), show: (l) => pct(ratio(l.first_try_wins, l.first_starts)) },
   { key: "apw", label: "Attempts per win", value: (l) => ratio(l.starts, l.wins), show: (l) => (l.wins && l.starts ? (l.starts / l.wins).toFixed(1) : "–") },
@@ -356,20 +419,28 @@ const LEVEL_COLS: { key: string; label: string; value: (l: LevelRow) => number |
 ];
 const byLevel = (a: LevelRow, b: LevelRow) => Number(a.level) - Number(b.level) || a.level.localeCompare(b.level, "en", { numeric: true });
 
-function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link: (over: Record<string, string | null>) => string, levelHref: (l: string) => string) {
-  const col = LEVEL_COLS.find((c) => c.key === sort);
+/** Columns with data: draws, abandons, stars and moves left only when some play has them. Fails are losses outside levels. */
+const levelCols = (levels: LevelRow[], label: string) => LEVEL_COLS.filter((c) =>
+  !["draws", "abandons", "stars", "moves"].includes(c.key) || levels.some((l) =>
+    (c.key === "stars" ? l.stars_n : c.key === "moves" ? l.moves_left_n : c.value(l)) as number > 0))
+  .map((c) => (c.key === "fails" && label !== "Level" ? { ...c, label: "Losses" } : c));
+
+function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link: (over: Record<string, string | null>) => string, levelHref: (l: string) => string,
+  o: { label: string; keyLabel: string; funnel: boolean }) {
+  const COLS = levelCols(levels, o.label);
+  const col = COLS.find((c) => c.key === sort);
   const sorted = [...levels].sort((a, b) => {
     if (!col) return dir === "desc" ? byLevel(b, a) : byLevel(a, b);
     const x = col.value(a), y = col.value(b);
     if (x === null || y === null) return x === y ? byLevel(a, b) : x === null ? 1 : -1; // no value sorts last
     return (dir === "desc" ? y - x : x - y) || byLevel(a, b);
   });
-  const head = [{ key: "level", label: "Level" }, ...LEVEL_COLS].map((c) => {
+  const head = [{ key: "level", label: esc(o.keyLabel) }, ...COLS].map((c) => {
     const on = (col?.key ?? "level") === c.key;
     const next = on && dir === "asc" ? "desc" : on ? "asc" : c.key === "level" ? "asc" : "desc";
     return `<th${on ? ` aria-sort="${dir === "asc" ? "ascending" : "descending"}"` : ""}><a href="${esc(link({ sort: c.key, dir: next }))}">${c.label}${on ? (dir === "asc" ? " ↑" : " ↓") : ""}</a></th>`;
   }).join("");
-  const rows = sorted.map((l) => `<tr><td><a href="${esc(levelHref(l.level))}">${esc(l.level)}</a></td>${LEVEL_COLS.map((c) =>
+  const rows = sorted.map((l) => `<tr><td><a href="${esc(levelHref(l.level))}">${esc(l.level)}</a></td>${COLS.map((c) =>
     `<td>${c.show ? c.show(l) : c.value(l)}</td>`).join("")}</tr>`).join("");
   // Progression: players who started each level, as a share of the first level's players.
   const funnel = [...levels].sort(byLevel);
@@ -378,14 +449,81 @@ function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link:
     const share = ratio(l.players, base);
     return `<li><span>Level ${esc(l.level)}: ${l.players} players (${pct(share)})</span><i style="width:${Math.round((share ?? 0) * 100)}%"></i></li>`;
   }).join("");
-  return `<section><h2>Levels</h2>
+  return `<section><h2>${esc(plural(o.label))}</h2>
     <div class="scroll"><table class="levels"><thead><tr>${head}</tr></thead>
-    <tbody>${rows || `<tr><td colspan="${LEVEL_COLS.length + 1}" class="empty">No level events in this range.</td></tr>`}</tbody></table></div>
-    <p class="note">Players are distinct devices that started the level. Win rate is wins / (wins + fails). First try win rate is wins on attempt 1 /
+    <tbody>${rows || `<tr><td colspan="${COLS.length + 1}" class="empty">No play events in this range.</td></tr>`}</tbody></table></div>
+    <p class="note">Players are distinct devices that started it. Win rate is wins / (wins + ${o.label === "Level" ? "fails" : "losses"}). First try win rate is wins on attempt 1 /
     starts of attempt 1. Attempts per win is starts / wins. Stars and moves left are averaged over wins that sent them. Quits are inferred:
-    level_quit events plus starts with no result for ${QUIT_AFTER_MS / 60_000} minutes, counted on the day of the start. Select a level for its detail.</p></section>
-  <section><h2>Progression</h2><p class="note">Players who started each level in the range, as a share of the first level's players.</p>
-    ${steps ? `<ol class="funnel">${steps}</ol>` : `<p class="empty">No level events in this range.</p>`}</section>`;
+    quits the game sends plus starts with no result for ${QUIT_AFTER_MS / 60_000} minutes, counted on the day of the start. Select one for its detail.</p></section>
+  ${o.funnel ? `<section><h2>Progression</h2><p class="note">Players who started each level in the range, as a share of the first level's players.</p>
+    ${steps ? `<ol class="funnel">${steps}</ol>` : `<p class="empty">No level events in this range.</p>`}</section>` : ""}`;
+}
+
+function resultsBody(r: { modes: Results[]; difficulties: Results[]; opponents: DimRow[] }) {
+  const table = (title: string, rows: Results[]) => rows.length ? `<section><h2>By ${title}</h2>
+    <div class="scroll"><table><thead><tr><th>${title[0].toUpperCase() + title.slice(1)}</th><th>Starts</th><th>Wins</th><th>Losses</th><th>Quits (inferred)</th>
+    <th>Draws</th><th>Abandons</th><th>Win rate</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.key)}</td><td>${x.starts}</td><td>${x.wins}</td>
+    <td>${x.fails}</td><td>${x.quits}</td><td>${x.draws}</td><td>${x.abandons}</td><td>${pct(ratio(x.wins, x.wins + x.fails))}</td></tr>`).join("")}</tbody></table></div></section>` : "";
+  const opp = r.opponents.length ? `<section><h2>By opponent</h2><p class="note">Ended plays by props.opponent.</p>
+    <div class="scroll"><table><thead><tr><th>Opponent</th><th>Plays</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win rate</th></tr></thead>
+    <tbody>${r.opponents.map((x) => `<tr><td>${esc(x.value)}</td><td>${x.plays}</td><td>${x.wins}</td><td>${x.losses}</td><td>${x.draws}</td>
+    <td>${pct(ratio(x.wins, x.wins + x.losses))}</td></tr>`).join("")}</tbody></table></div></section>` : "";
+  return table("mode", r.modes) + table("difficulty", r.difficulties) + opp;
+}
+
+function contentBody(label: string, values: DimRow[], plays: number) {
+  const rows = values.map((v) => `<tr><td>${esc(v.value)}</td><td>${v.plays}</td><td>${pct(ratio(v.plays, plays))}</td><td>${v.players}</td>
+    <td>${v.wins}</td><td>${v.losses}</td><td>${v.draws}</td><td>${pct(ratio(v.wins, v.wins + v.losses))}</td>
+    <td>${v.score_n ? (v.score_sum / v.score_n).toFixed(2) : "–"}</td></tr>`).join("");
+  return `<section><h2>${esc(label)}</h2>
+    <p class="note">Ended plays by value. Pick rate is plays with the value / all ${plays} ended plays; a play with several values, such as a deck,
+    counts once for each. Win rate is wins / (wins + losses). Score is the value sent with play_end. Player days counts each device once a day.</p>
+    <div class="scroll"><table><thead><tr><th>${esc(label)}</th><th>Plays</th><th>Pick rate</th><th>Player days</th><th>Wins</th><th>Losses</th><th>Draws</th>
+    <th>Win rate</th><th>Avg score</th></tr></thead><tbody>${rows || `<tr><td colspan="9" class="empty">No plays with this dimension in this range.</td></tr>`}</tbody></table></div></section>`;
+}
+
+function progressBody(profile: Profile | null, rows: TrackRow[]) {
+  const tracks = profile?.tracks.filter((t) => t.milestones.length) ?? [];
+  if (!tracks.length) return `<section><p class="empty">Declare tracks with milestones in the game profile in Settings.</p></section>`;
+  return tracks.map((t) => {
+    const get = (b: string) => rows.find((r) => r.track === t.key && r.bucket === b) ?? { devices: 0, reached: 0, reach_days: 0 };
+    const ms = t.milestones;
+    const below = get(`<${ms[0]}`);
+    const lines = [`<tr><td>Below ${ms[0]}</td><td>${below.devices}</td><td>–</td><td>–</td><td>–</td></tr>`, ...ms.map((m, i) => {
+      const r = get(String(m));
+      const stopped = Math.max(0, r.reached - (i + 1 < ms.length ? get(String(ms[i + 1])).reached : 0));
+      return `<tr><td>${m}+</td><td>${r.devices}</td><td>${r.reached}</td><td>${r.reached ? (r.reach_days / r.reached).toFixed(1) : "–"}</td><td>${stopped}</td></tr>`;
+    })];
+    return `<section><h2>${esc(t.label ?? t.key)}</h2>
+      <p class="note">Player days counts each device once a day, at its highest ${esc(t.key)} that day. Reached counts devices that first got to a
+      milestone in the range, with the average days from install. Stopped here is reached minus reached the next milestone.</p>
+      <div class="scroll"><table><thead><tr><th>Value</th><th>Player days</th><th>Reached</th><th>Avg days to reach</th><th>Stopped here</th></tr></thead>
+      <tbody>${lines.join("")}</tbody></table></div></section>`;
+  }).join("");
+}
+
+function flowsBody(rows: StepRow[]) {
+  const flows = [...new Set(rows.map((r) => r.flow))];
+  if (!flows.length) return `<section><p class="empty">No step or tutorial events in this range.</p></section>`;
+  const label = (flow: string, step: number) => (step === STEP_DONE ? "Complete" : flow === "tutorial" && step === 0 ? "Begin" : String(step));
+  return flows.map((flow) => {
+    const steps = rows.filter((r) => r.flow === flow);
+    const lines = steps.map((r, i) => `<tr><td>${label(flow, r.step)}</td><td>${r.devices}</td>
+      <td>${i ? pct(1 - (ratio(r.devices, steps[i - 1].devices) ?? 1)) : "–"}</td><td>${dur(ratio(r.duration_sum, r.duration_n))}</td></tr>`).join("");
+    return `<section><h2>${esc(flow)}</h2><p class="note">Players are distinct devices per day that reached the step, summed. Drop off is against the previous step.</p>
+      <div class="scroll"><table><thead><tr><th>Step</th><th>Players</th><th>Drop off</th><th>Avg time</th></tr></thead><tbody>${lines}</tbody></table></div></section>`;
+  }).join("");
+}
+
+function profileBody(current: Proj, profile: Profile | null, suggested: string[]) {
+  return `<section><h2>Game profile</h2>
+    <p>${current.profile ? `Saved: ${esc(JSON.parse(current.profile).preset)}` : "Not saved."}${current.profile_detected ? ` Detected: ${esc(current.profile_detected)}.` : ""}</p>
+    ${suggested.length ? `<p class="note">Suggested dimensions: ${esc(suggested.join(", "))}.</p>` : ""}
+    <p class="note">The profile names the plays, and declares the tracks, dimensions and flows the rollups count. Saving it rebuilds the last 90 days.</p>
+    <form method="post" action="/settings/profile" class="profile"><input type="hidden" name="project" value="${esc(current.id)}">
+      <label>Preset <select name="preset"><option value="">Use the JSON below</option>${Object.keys(PRESETS).map((k) => `<option value="${k}">${k}</option>`).join("")}</select></label>
+      <label>Profile JSON <textarea name="profile" rows="8" maxlength="4000">${esc(profile ? JSON.stringify(profile, null, 1) : "")}</textarea></label>
+      <button>Save profile</button></form></section>`;
 }
 
 type Counts = { key: string; starts: number; wins: number; fails: number; quits: number };
@@ -547,7 +685,9 @@ details{flex-basis:100%}summary{cursor:pointer;color:var(--muted);padding:4px 0}
 form{display:flex;flex-wrap:wrap;gap:8px;align-items:end;margin-top:8px}
 form.tz{margin:0}
 label{display:flex;flex-direction:column;font-size:13px;color:var(--muted)}
-input,select{font:inherit;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);min-height:40px}
+form.profile{flex-direction:column;align-items:stretch}textarea{font:13px/1.4 ui-monospace,monospace}
+nav.sub a{padding:4px 10px}
+input,select,textarea{font:inherit;padding:8px;border:1px solid var(--line);border-radius:6px;background:var(--bg);color:var(--text);min-height:40px}
 button{font:inherit;min-height:40px;padding:0 16px;border:0;border-radius:6px;background:var(--s1);color:#fff;cursor:pointer}
 .filters{padding:12px 16px}.filters form{margin-top:12px}
 .filters .summary{display:block;font-size:14px;color:var(--text);cursor:pointer}.filters .summary strong{margin-right:6px}

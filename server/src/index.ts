@@ -1,4 +1,4 @@
-import { checkAdmin, createProject, createTestKey, dashboard, isPage, setTimezone } from "./dashboard";
+import { checkAdmin, createProject, createTestKey, dashboard, isPage, setProfile, setTimezone } from "./dashboard";
 import { CORS, ingest } from "./ingest";
 import { runCron } from "./rollup";
 
@@ -14,6 +14,7 @@ export default {
     if (isPage(pathname) && method === "GET") return (await checkAdmin(request, env)) ?? dashboard(request, env);
     if (pathname === "/projects" && method === "POST") return (await checkAdmin(request, env)) ?? createProject(request, env);
     if (pathname === "/settings/tz" && method === "POST") return (await checkAdmin(request, env)) ?? setTimezone(request, env);
+    if (pathname === "/settings/profile" && method === "POST") return (await checkAdmin(request, env)) ?? setProfile(request, env);
     if (pathname === "/settings/test-key" && method === "POST") return (await checkAdmin(request, env)) ?? createTestKey(request, env);
     return new Response("Not Found", { status: 404 });
   },

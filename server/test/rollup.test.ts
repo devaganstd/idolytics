@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { DAY } from "../src/rollup";
-import { at, MIN, NOW, seed, seedEconomy } from "./fixture";
+import { at, MIN, NOW, seed, seedAsPlays, seedEconomy, seedMatch } from "./fixture";
 import { createProject, raw, reset, rollUp, rows } from "./helpers";
 import { runCron } from "../src/rollup";
 
@@ -10,7 +10,7 @@ const snapshot = async () => ({
   devices: await table("devices", "device_id, first_day, version, platform, country, open_min", "device_id"),
   deviceDays: await table("device_days", "day, device_id, version, platform, is_new, sessions, playtime_ms, events", "day, device_id"),
   cohorts: await table("cohort_days", "first_day, day, version, platform, country, devices", "first_day, day, platform"),
-  levels: await table("level_days", "*", "day, level, platform"),
+  levels: await table("play_days", "*", "day, level, platform"),
   events: await table("event_days", "day, name, version, platform, count, devices, value_sum", "day, name, platform"),
 });
 
@@ -38,7 +38,7 @@ describe("rollup", () => {
       { first_day: "2026-11-01", day: "2026-11-03", version: "1.0", platform: "ios", country: "US", devices: 1 },
       { first_day: "2026-11-02", day: "2026-11-02", version: "1.1", platform: "android", country: "ID", devices: 1 },
     ]);
-    const zero = { starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
+    const zero = { kind: "level", mode: "", difficulty: "", draws: 0, abandons: 0, starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
     expect(s.levels).toEqual([
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "android",
         starts: 2, players: 1, first_starts: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
@@ -124,6 +124,101 @@ describe("rollup", () => {
       { name: "level_fail", detail: "out_of_moves", count: 2 },
       { name: "level_quit", detail: "menu", count: 1 },
     ]);
+  });
+
+  it("rolls up play_start and play_end with kind level exactly like level events", async () => {
+    await seed();
+    await rollUp(NOW);
+    const levels = await snapshot();
+    const detail = await rows("SELECT * FROM level_events ORDER BY day, level, name, detail, platform");
+    await reset();
+    await createProject();
+    await seedAsPlays();
+    await rollUp(NOW);
+    const plays = await snapshot();
+    expect(plays.levels).toEqual(levels.levels);
+    expect(await rows("SELECT * FROM level_events ORDER BY day, level, name, detail, platform")).toEqual(detail);
+  });
+
+  it("rolls up matches, dimensions, tracks and flows to a hand count", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const plays = await rows(`SELECT day, level, difficulty, platform, starts, players, wins, fails, quits, draws, abandons
+      FROM play_days WHERE kind = 'match' ORDER BY day, level, difficulty`);
+    expect(plays).toEqual([
+      { day: "2026-11-01", level: "delta", difficulty: "hard", platform: "ios", starts: 1, players: 1, wins: 0, fails: 0, quits: 0, draws: 0, abandons: 1 },
+      { day: "2026-11-01", level: "hourglass", difficulty: "easy", platform: "android", starts: 1, players: 1, wins: 1, fails: 0, quits: 0, draws: 0, abandons: 0 },
+      { day: "2026-11-01", level: "hourglass", difficulty: "normal", platform: "android", starts: 1, players: 0, wins: 0, fails: 1, quits: 0, draws: 0, abandons: 0 },
+      { day: "2026-11-01", level: "ring", difficulty: "easy", platform: "ios", starts: 1, players: 1, wins: 1, fails: 0, quits: 0, draws: 0, abandons: 0 },
+      { day: "2026-11-01", level: "ring", difficulty: "hard", platform: "android", starts: 1, players: 1, wins: 0, fails: 0, quits: 0, draws: 1, abandons: 0 },
+      { day: "2026-11-02", level: "delta", difficulty: "normal", platform: "ios", starts: 1, players: 1, wins: 0, fails: 1, quits: 0, draws: 0, abandons: 0 },
+      { day: "2026-11-02", level: "hourglass", difficulty: "easy", platform: "android", starts: 1, players: 1, wins: 0, fails: 0, quits: 1, draws: 0, abandons: 0 },
+    ]);
+    // Detected from play_start with kind match.
+    expect(await env.DB.prepare("SELECT profile_detected FROM projects").first()).toEqual({ profile_detected: "match_battle" });
+    const deck = await rows(`SELECT value, SUM(plays) AS plays, SUM(wins) AS wins, SUM(losses) AS losses, SUM(draws) AS draws,
+      ROUND(SUM(score_sum), 2) AS score, SUM(score_n) AS score_n FROM dim_days WHERE dim = 'deck' GROUP BY value ORDER BY value`);
+    const all = { plays: 6, wins: 2, losses: 2, draws: 1, score: 2.9, score_n: 5 };
+    expect(deck).toEqual([
+      { value: "burst", ...all }, { value: "canon", ...all }, { value: "frost", ...all }, { value: "meteor", ...all }, { value: "pierce", ...all },
+      { value: "wall", plays: 3, wins: 1, losses: 1, draws: 1, score: 1.8, score_n: 3 },
+    ]);
+    expect(await rows("SELECT dim, value, SUM(plays) AS plays FROM dim_days WHERE dim IN ('', 'opponent') GROUP BY dim, value ORDER BY dim"))
+      .toEqual([{ dim: "", value: "", plays: 6 }, { dim: "opponent", value: "bot", plays: 6 }]);
+    expect(await rows("SELECT day, track, bucket, devices, reached, reach_days FROM track_days ORDER BY track, day, bucket")).toEqual([
+      { day: "2026-11-01", track: "arena", bucket: "2", devices: 1, reached: 1, reach_days: 0 },
+      { day: "2026-11-02", track: "arena", bucket: "3", devices: 1, reached: 1, reach_days: 1 },
+      { day: "2026-11-01", track: "trophies", bucket: "300", devices: 1, reached: 1, reach_days: 0 },
+      { day: "2026-11-01", track: "trophies", bucket: "<300", devices: 1, reached: 0, reach_days: 0 },
+      { day: "2026-11-02", track: "trophies", bucket: "800", devices: 1, reached: 1, reach_days: 1 },
+      { day: "2026-11-02", track: "trophies", bucket: "<300", devices: 1, reached: 0, reach_days: 0 },
+    ]);
+    expect(await rows("SELECT flow, step, SUM(devices) AS devices, SUM(duration_sum) AS duration_sum, SUM(duration_n) AS duration_n FROM step_days GROUP BY flow, step ORDER BY flow, step")).toEqual([
+      { flow: "tutorial", step: 0, devices: 1, duration_sum: 0, duration_n: 0 },
+      { flow: "tutorial", step: 1, devices: 1, duration_sum: 0, duration_n: 0 },
+      { flow: "tutorial", step: 999, devices: 1, duration_sum: 120_000, duration_n: 1 },
+      { flow: "tutorial1", step: 1, devices: 2, duration_sum: 12_000, duration_n: 2 },
+      { flow: "tutorial1", step: 2, devices: 2, duration_sum: 18_000, duration_n: 2 },
+      { flow: "tutorial1", step: 3, devices: 1, duration_sum: 4000, duration_n: 1 },
+    ]);
+  });
+
+  it("keeps milestones reached before a rebuild window counted once", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    // Pretend the milestones were reached long before the 90 day rebuild window.
+    await env.DB.batch([
+      env.DB.prepare("UPDATE track_days SET day = '2026-01-01' WHERE reached > 0"),
+      env.DB.prepare("UPDATE devices SET first_day = '2026-01-01', tracks = (SELECT json_group_object(key, '2026-01-01') FROM json_each(devices.tracks)) WHERE tracks IS NOT NULL"),
+      env.DB.prepare("UPDATE projects SET rollup_tz = tz_min + 100000"),
+    ]);
+    await rollUp(NOW, 4);
+    expect(await rows("SELECT day, SUM(reached) AS reached FROM track_days GROUP BY day")).toEqual([{ day: "2026-01-01", reached: 4 }, { day: "2026-11-01", reached: 0 }, { day: "2026-11-02", reached: 0 }]);
+  });
+
+  it("gives the same match rollups across many runs, and caps dimension values", async () => {
+    await seedMatch();
+    await rollUp(NOW);
+    const q = () => rows(`SELECT 'p' t, day, level k, difficulty v, starts a, wins b, quits c FROM play_days
+      UNION ALL SELECT 'd', day, dim, value, plays, players, wins FROM dim_days
+      UNION ALL SELECT 't', day, track, bucket, devices, reached, reach_days FROM track_days
+      UNION ALL SELECT 's', day, flow, step, devices, duration_sum, duration_n FROM step_days ORDER BY 1, 2, 3, 4`);
+    const once = await q();
+    await reset();
+    await createProject();
+    await seedMatch();
+    await rollUp(NOW, 4);
+    expect(await q()).toEqual(once);
+
+    await reset();
+    await createProject();
+    for (let i = 0; i < 203; i++) {
+      await raw({ name: "play_end", device: "x", session: "s", ts: at(0, 10, i % 60), level: "b", attempt: i,
+        props: { kind: "match", result: "win", deck: `card${i}` } });
+    }
+    await rollUp(NOW);
+    expect(await rows("SELECT COUNT(DISTINCT value) AS n, SUM(value = 'other') AS other FROM dim_days WHERE dim = 'deck'")).toEqual([{ n: 201, other: 1 }]);
+    expect(await rows("SELECT SUM(plays) AS n FROM dim_days WHERE dim = 'deck' AND value = 'other'")).toEqual([{ n: 3 }]);
   });
 
   it("rolls up economy and ad events by currency and detail", async () => {
