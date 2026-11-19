@@ -23,7 +23,7 @@ namespace IdolyticsSdk
         internal int maxBatch = MaxEvents;
         bool sending;
         bool warnedRejected;
-        long backgroundSince = -1;
+        internal long backgroundSince = -1;
 
         IEnumerator Start()
         {
@@ -168,22 +168,25 @@ namespace IdolyticsSdk
 
         void OnApplicationQuit()
         {
+            if (backgroundSince < 0) Idolytics.MarkSessionEnd(); // when already in the background, the session ended then
             Idolytics.Save();
             Flush();
         }
 
-        void Background()
+        internal void Background()
         {
             if (backgroundSince >= 0) return;
             backgroundSince = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Idolytics.MarkSessionEnd(); // if the app never comes back, this is where the session ended
             Idolytics.Save();
             Flush();
         }
 
-        void Foreground()
+        internal void Foreground()
         {
             if (backgroundSince < 0) return;
             if (DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - backgroundSince > SessionTimeoutMs) Idolytics.StartSession();
+            else Idolytics.ClearSessionEnd();
             backgroundSince = -1;
         }
     }

@@ -10,7 +10,7 @@ namespace IdolyticsSdk.Tests
     {
         const string Board = "idl_test_board";
         const string Other = "idl_test_other";
-        static readonly string[] Keys = { "idolytics.queue", "idolytics.play" };
+        static readonly string[] Keys = { "idolytics.queue", "idolytics.play", "idolytics.last_session_end" };
         float clock;
         string[] saved;
 
@@ -216,6 +216,114 @@ namespace IdolyticsSdk.Tests
             LogAssert.Expect(LogType.Warning, "[idolytics] PlayEnd called with no open play.");
             Idolytics.PlayEnd(PlayResult.Win);
             Assert.AreEqual(0, Events("play_end").Count);
+        }
+
+        static long Now() => System.DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+
+        static long? SinceLastMs()
+        {
+            var m = System.Text.RegularExpressions.Regex.Match(Events("session_start").Last(), "\"since_last_ms\":(-?[0-9]+)");
+            return m.Success ? long.Parse(m.Groups[1].Value) : (long?)null;
+        }
+
+        [Test]
+        public void FirstSessionEverHasNoSinceLast()
+        {
+            Idolytics.Track("tap");
+            Assert.IsNull(SinceLastMs());
+        }
+
+        [Test]
+        public void SessionStartAfterRestartHasTimeSinceTheLastSessionEnd()
+        {
+            Idolytics.Track("tap");
+            Idolytics.MarkSessionEnd(); // pause, quit or session end
+            Idolytics.Save();
+            PlayerPrefs.SetString("idolytics.last_session_end", (Now() - 60000).ToString()); // that end was a minute ago
+            Kill();
+
+            Idolytics.Track("tap");
+            long? since = SinceLastMs();
+            Assert.That(since, Is.InRange(60000L, 70000L));
+        }
+
+        [Test]
+        public void MarkSessionEndThenRestartGivesASmallNonNegativeGap()
+        {
+            Idolytics.Track("tap");
+            Idolytics.MarkSessionEnd();
+            Kill();
+
+            Idolytics.Track("tap");
+            Assert.That(SinceLastMs(), Is.InRange(0L, 10000L));
+        }
+
+        [Test]
+        public void BackgroundShorterThan30sKeepsTheSessionAndForgetsItsEnd()
+        {
+            var go = new GameObject("sender-test");
+            try
+            {
+                var sender = go.AddComponent<IdolyticsSender>();
+                Idolytics.Track("tap");
+                sender.Background();
+                Assert.IsTrue(PlayerPrefs.HasKey("idolytics.last_session_end"));
+                sender.Foreground();
+
+                Assert.IsFalse(PlayerPrefs.HasKey("idolytics.last_session_end"));
+                Assert.AreEqual(1, Events("session_start").Count);
+            }
+            finally { Object.DestroyImmediate(go); }
+        }
+
+        [Test]
+        public void BackgroundLongerThan30sStartsASessionWithTheGap()
+        {
+            var go = new GameObject("sender-test");
+            try
+            {
+                var sender = go.AddComponent<IdolyticsSender>();
+                Idolytics.Track("tap");
+                sender.Background();
+                sender.backgroundSince -= 60000; // the app went to the background a minute ago
+                PlayerPrefs.SetString("idolytics.last_session_end", (Now() - 60000).ToString());
+                sender.Foreground();
+
+                Assert.AreEqual(2, Events("session_start").Count);
+                Assert.That(SinceLastMs(), Is.InRange(60000L, 70000L));
+                Assert.IsFalse(PlayerPrefs.HasKey("idolytics.last_session_end"), "a session end is used once");
+            }
+            finally { Object.DestroyImmediate(go); }
+        }
+
+        [Test]
+        public void SessionEndInTheFutureGivesNoSinceLast()
+        {
+            PlayerPrefs.SetString("idolytics.last_session_end", (Now() + 3600000).ToString()); // the device clock moved back
+            Idolytics.Track("tap");
+            Assert.IsNull(SinceLastMs());
+        }
+
+        [Test]
+        public void OfflineRewardFields()
+        {
+            Idolytics.OfflineReward(7200000, 1.5e12, "gold", 2, "ad");
+
+            string e = Events("offline_reward").Single();
+            StringAssert.Contains("\"duration_ms\":7200000", e);
+            StringAssert.Contains("\"value\":1500000000000", e);
+            StringAssert.Contains("\"currency\":\"gold\"", e);
+            StringAssert.Contains("\"multiplier\":2", e);
+            StringAssert.Contains("\"via\":\"ad\"", e);
+        }
+
+        [Test]
+        public void PrestigeResult()
+        {
+            Idolytics.PlayStart(Board, kind: "run");
+            Idolytics.PlayEnd(PlayResult.Prestige, score: 42);
+
+            StringAssert.Contains("\"result\":\"prestige\"", Events("play_end").Single());
         }
 
         [Test]

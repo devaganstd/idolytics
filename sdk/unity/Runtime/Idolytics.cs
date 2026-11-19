@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.Text;
 using UnityEngine;
 
@@ -11,9 +12,10 @@ namespace IdolyticsSdk
     /// </summary>
     public static partial class Idolytics
     {
-        internal const string SdkVersion = "unity/0.2.0";
+        internal const string SdkVersion = "unity/0.2.1";
         const string InstallIdKey = "idolytics.install_id";
         const string QueueKey = "idolytics.queue";
+        const string LastSessionEndKey = "idolytics.last_session_end";
         const float SaveInterval = 2;
 
         internal static IdolyticsSettings Settings;
@@ -105,8 +107,24 @@ namespace IdolyticsSdk
         internal static void StartSession()
         {
             SessionId = Guid.NewGuid().ToString();
-            Enqueue("session_start", null);
+            Dictionary<string, object> props = null;
+            // No prop for the first session ever, or when the device clock moved back past the saved end.
+            if (long.TryParse(PlayerPrefs.GetString(LastSessionEndKey), NumberStyles.Integer, Inv, out long lastEnd))
+            {
+                long since = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - lastEnd;
+                if (since >= 0) props = new Dictionary<string, object> { ["since_last_ms"] = since };
+            }
+            // Used once: if this session ends without a pause or quit (a crash), the next has no prop rather than a stale gap.
+            ClearSessionEnd();
+            Enqueue("session_start", props);
         }
+
+        /// <summary>Remembers now as the end of the session; the next session_start sends the time since.</summary>
+        internal static void MarkSessionEnd() =>
+            PlayerPrefs.SetString(LastSessionEndKey, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString(Inv));
+
+        /// <summary>The session goes on after all (back within 30 s), so its saved end no longer holds.</summary>
+        internal static void ClearSessionEnd() => PlayerPrefs.DeleteKey(LastSessionEndKey);
 
         static void Enqueue(string name, IDictionary<string, object> props)
         {

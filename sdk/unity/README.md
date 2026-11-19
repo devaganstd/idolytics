@@ -35,7 +35,7 @@ The queue is saved at most every 2 s after `Track`, and when the app pauses or l
 
 The Ninja Smash sample (Package Manager > Samples) is a complete adapter from a game's own analytics interface.
 
-## Plays, progress and steps (0.2.0)
+## Plays, progress, steps and offline rewards (0.2.0, 0.2.1)
 
 These helpers send the generic events every genre maps onto. `Track` is unchanged, so an existing integration keeps working.
 
@@ -46,6 +46,7 @@ Idolytics.PlayEnd(PlayResult.Win, score: 0.92, reason: "knockout",
     props: new() { ["cards_deployed"] = 14, ["merges"] = 3 });
 Idolytics.Progress("trophies", 330, delta: 30);
 Idolytics.Step("tutorial1", 3, "deploy_first_tower", durationMs: 4200);
+Idolytics.OfflineReward(durationMs: 7200000, value: 1.5e12, currency: "gold", multiplier: 2, via: "ad");
 ```
 
 - `PlayStart(level, kind, mode, difficulty, props)` sends `play_start`. `level` is the play key (a level id, a board or a stage); `kind` is `level`, `match`, `run` or `round`. Without `props["attempt"]`, the attempt is counted per play key on the device.
@@ -54,6 +55,9 @@ Idolytics.Step("tutorial1", 3, "deploy_first_tower", durationMs: 4200);
 - A play still open when the app closes is ended as `abandon` on the next launch, with the duration up to the last save. While a play is open and `Idolytics.Init` has run, the SDK saves every 2 s, and also when the app pauses or loses focus. Its `ts` is that last save.
 - `duration_ms` is scaled game time (`Time.time`): it stops while `Time.timeScale` is 0 and barely moves while the app is in the background.
 - `Progress(track, value, delta)` sends `progress`, and `Step(flow, step, stepId, durationMs)` sends `step`.
+- `OfflineReward(durationMs, value, currency, multiplier, via)` sends `offline_reward` (0.2.1). `via` is `free`, `ad` or `iap`.
+- Idle games: a prestige cycle is a play of kind `run` that ends with `PlayResult.Prestige` (0.2.1), with the prestige currency gained as the score.
+- `session_start` carries `since_last_ms` (0.2.1): the time since the previous session ended on this device, saved when the app pauses or quits. The first session has none.
 
 The Match game sample (Package Manager > Samples) maps a 1v1 match game against a bot onto these calls.
 

@@ -7,7 +7,7 @@ using UnityEngine;
 namespace IdolyticsSdk
 {
     /// <summary>How a play ended. Sent as props.result in lower case.</summary>
-    public enum PlayResult { Win, Loss, Draw, Quit, Abandon }
+    public enum PlayResult { Win, Loss, Draw, Quit, Abandon, Prestige }
 
     // Plays, progression tracks and flow steps (docs/09-game-profiles.md, sections 2 and 7).
     public static partial class Idolytics
@@ -92,6 +92,16 @@ namespace IdolyticsSdk
         /// <summary>Sends step: step number <paramref name="step"/> of a flow, such as the tutorial.</summary>
         public static void Step(string flow, int step, string stepId = null, long? durationMs = null) =>
             Track("step", new Dictionary<string, object> { ["flow"] = flow, ["step"] = step, ["step_id"] = stepId, ["duration_ms"] = durationMs });
+
+        /// <summary>
+        /// Sends offline_reward: what the game paid out for <paramref name="durationMs"/> offline.
+        /// <paramref name="via"/> is free, ad or iap; <paramref name="multiplier"/> is the boost taken (1, 2, 3).
+        /// </summary>
+        public static void OfflineReward(long durationMs, double value, string currency, int multiplier = 1, string via = "free") =>
+            Track("offline_reward", new Dictionary<string, object>
+            {
+                ["duration_ms"] = durationMs, ["value"] = value, ["currency"] = currency, ["multiplier"] = multiplier, ["via"] = via,
+            });
 
         static Dictionary<string, object> EndProps(Dictionary<string, object> start, PlayResult result, long durationMs) =>
             new Dictionary<string, object>(start)

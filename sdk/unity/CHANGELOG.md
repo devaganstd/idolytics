@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- Added `Idolytics.OfflineReward` for offline earnings: `duration_ms`, `value`, `currency`, `props.multiplier` and `props.via`.
+- `session_start` now carries `props.since_last_ms`, the time since the previous session on this device ended (on pause, quit or session end). The first session has none, and a device clock that moved back gives none.
+- Added `PlayResult.Prestige` (result `prestige`) for idle games: a prestige cycle is a play of kind `run`.
+
 ## 0.2.0
 
 - Added `Idolytics.PlayStart` and `Idolytics.PlayEnd` for levels, matches, runs and rounds, with `PlayResult`. One play is open at a time; `PlayStart` ends an open play as `abandon`.
