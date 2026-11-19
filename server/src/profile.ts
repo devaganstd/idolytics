@@ -5,6 +5,8 @@ export interface Track { key: string; label?: string; milestones: number[]; scal
 export interface Dim { key: string; label?: string; multi?: boolean }
 export interface Profile {
   preset: string; play_label: string; play_kinds: string[]; tracks: Track[]; dimensions: Dim[]; flows: string[];
+  /** A numeric play_end props key with the in-game play time in seconds, such as match_sec, without waiting screens. */
+  play_time_prop?: string;
 }
 
 /** Dimension key "level" is the play key itself, such as a board. */
@@ -17,7 +19,7 @@ export const PRESETS: Record<string, Profile> = {
     preset: "match_battle", play_label: "Match", play_kinds: ["match"],
     tracks: [{ key: "trophies", label: "Trophies", milestones: [300, 800, 1500] }, { key: "arena", label: "Arena", milestones: [2, 3, 4] }],
     dimensions: [{ key: "level", label: "Board" }, { key: "mode" }, { key: "difficulty" }, { key: "opponent" }, { key: "deck", multi: true, label: "Card" }],
-    flows: [],
+    flows: [], play_time_prop: "match_sec",
   },
   run_roguelike: {
     preset: "run_roguelike", play_label: "Run", play_kinds: ["run"],
@@ -85,6 +87,8 @@ export function parseProfile(v: unknown): Profile {
   const o = v as Record<string, unknown>;
   const base = Object.hasOwn(PRESETS, String(o.preset)) ? PRESETS[String(o.preset)] : PRESETS.puzzle_levels;
   const has = (k: string) => o[k] !== undefined;
+  // "" or null unsets the preset's play_time_prop.
+  const timeProp = !has("play_time_prop") ? base.play_time_prop : o.play_time_prop === "" || o.play_time_prop === null ? undefined : str(o.play_time_prop, 40);
   return {
     preset: base.preset,
     play_label: has("play_label") ? str(o.play_label, 20) : base.play_label,
@@ -102,6 +106,7 @@ export function parseProfile(v: unknown): Profile {
       return { key: str(r?.key, 40), ...(r?.label ? { label: str(r.label, 40) } : {}), ...(r?.multi === true ? { multi: true } : {}) };
     }).filter((d, i, all) => { if (all.findIndex((x) => x.key === d.key) !== i) throw new Error(`dimension ${d.key} is declared twice`); return true; }) : base.dimensions,
     flows: has("flows") ? list(o.flows, 10, (x) => str(x, 40)) : base.flows,
+    ...(timeProp ? { play_time_prop: timeProp } : {}),
   };
 }
 

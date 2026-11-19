@@ -36,6 +36,13 @@ const econKeys = (name: string) => name.startsWith("booster_") ? ["booster"] : n
   : name === "iap_purchase" ? ["product"] : name === "currency_spent" ? ["sink"] : name === "offline_reward" ? ["via"] : ["source", "sink"];
 /** Session gap buckets (docs/10-v0.3.1.md section 2.2), by session_start props.since_last_ms. */
 const GAPS: [number, string][] = [[3_600_000, "<1h"], [4 * 3_600_000, "1-4h"], [12 * 3_600_000, "4-12h"], [DAY, "12-24h"], [Infinity, "24h+"]];
+/** Upper edges in seconds of the play length buckets dh<i> and th<i>; the last bucket is 48 h and over. */
+export const DUR_EDGES = [5, 10, 20, 30, 45, 60, 90, 120, 180, 300, 600, 1800, 3600, 7200, 14_400, 28_800, 57_600, 86_400, 172_800];
+export const DH = Array.from({ length: DUR_EDGES.length + 1 }, (_, i) => `dh${i}`);
+export const TH = DH.map((c) => "t" + c.slice(1));
+const durBucket = (sec: number) => { const i = DUR_EDGES.findIndex((e) => sec < e); return i < 0 ? DUR_EDGES.length : i; };
+/** Results of a completed play, whose length counts; quits and abandons do not. */
+const COMPLETED = new Set(["wins", "fails", "draws", "prestiges"]);
 /** Play events; one without a level counts under this play key. */
 const PLAY_EVENTS = new Set(["level_start", "level_complete", "level_fail", "level_quit", "play_start", "play_end"]);
 export const NO_LEVEL = "(none)";
@@ -285,7 +292,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     const isPlay = PLAY_EVENTS.has(r.name);
     if (r.level === null && !isPlay) continue;
     for (const [key, val] of isPlay ? Object.entries(props) : []) {
-      if (NOT_DIMS.has(key) || !text(val) || Object.keys(seenKeys.k).length >= SEEN_MAX && !seenKeys.k[key]) continue;
+      if (NOT_DIMS.has(key) || key === profile?.play_time_prop || !text(val) || Object.keys(seenKeys.k).length >= SEEN_MAX && !seenKeys.k[key]) continue;
       const e = seenKeys.k[key] = seenKeys.k[key]?.d >= weekAgo ? seenKeys.k[key] : { d: day, v: [] };
       if (day > e.d) e.d = day;
       for (const part of typeof val === "string" ? val.split(",").slice(0, 10) : [val]) {
@@ -320,7 +327,13 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
     const field = Object.hasOwn(RESULT_FIELD, result) ? RESULT_FIELD[result] : undefined;
     if (field) add(levels, lk, field, 1);
     if (field === "wins" && r.attempt === 1) add(levels, lk, "first_try_wins", 1);
-    if (r.duration_ms !== null) { add(levels, lk, "duration_sum", r.duration_ms); add(levels, lk, "duration_n", 1); }
+    if (field && COMPLETED.has(field) && r.duration_ms !== null) {
+      add(levels, lk, "duration_sum", r.duration_ms); add(levels, lk, "duration_n", 1); add(levels, lk, DH[durBucket(r.duration_ms / 1000)], 1);
+    }
+    const t = profile?.play_time_prop ? props[profile.play_time_prop] : undefined;
+    if (field && COMPLETED.has(field) && typeof t === "number" && Number.isFinite(t) && t >= 0) {
+      add(levels, lk, "time_sum", t); add(levels, lk, "time_n", 1); add(levels, lk, TH[durBucket(t)], 1);
+    }
     if (field === "wins" && typeof props.stars === "number") { add(levels, lk, "stars_sum", props.stars); add(levels, lk, "stars_n", 1); }
     if (field === "wins" && typeof props.moves_left === "number") { add(levels, lk, "moves_left_sum", props.moves_left); add(levels, lk, "moves_left_n", 1); }
     const o = dev.open[ok];
@@ -370,7 +383,8 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   });
   const flat = (m: Map<string, Record<string, number>>, fields: string[]) =>
     [...m].map(([k, o]) => [...JSON.parse(k), ...fields.map((f) => o[f] ?? 0)]);
-  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "draws", "abandons", "prestiges", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts"];
+  const LEVEL_FIELDS = ["starts", "players", "wins", "fails", "quits", "draws", "abandons", "prestiges", "first_try_wins", "duration_sum", "duration_n", "stars_sum", "stars_n", "moves_left_sum", "moves_left_n", "first_starts",
+    "time_sum", "time_n", ...DH, ...TH];
   const DIM_FIELDS = ["plays", "players", "wins", "losses", "draws", "score_sum", "score_n"];
   const TRACK_FIELDS = ["devices", "reached", "reach_days"];
   const STEP_FIELDS = ["devices", "duration_sum", "duration_n", "skips"];

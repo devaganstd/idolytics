@@ -176,3 +176,28 @@ export async function seedIdle() {
   await income("i2", "b", at(1, 20, 10), 7e9);
   await start("i2", "c", at(1, 21), 2 * H);
 }
+
+/**
+ * Hand counted match lengths on 11-01, board "arena", mode "ranked". h1 (android) and h2 (editor, dev plays).
+ *   Completed plays, duration_ms in seconds / props.match_sec: h1 win 40/37, loss 70/66, draw 100/95; h2 win 3/1, loss 13/10.
+ *   Not completed, so left out: h1 abandon 500/480 and quit 900/880.
+ *   All: avg 45.2 s, median ≈ 37.5 s, p90 ≈ 105 s; match_sec avg 41.8, median ≈ 37.5, p90 ≈ 105.
+ *   Without the editor: avg 70 s, median ≈ 75 s, p90 ≈ 111 s; match_sec avg 66, median ≈ 75, p90 ≈ 111.
+ */
+export async function seedDurations() {
+  let attempt = 0;
+  const play = async (device: string, ts: number, result: string, sec: number, matchSec: number) => {
+    const props = { kind: "match", mode: "ranked" };
+    const a = ++attempt;
+    const more = { session: device + "s", level: "arena", attempt: a, platform: device === "h2" ? "editor" : "android" };
+    await raw({ name: "play_start", device, ts, ...more, props });
+    await raw({ name: "play_end", device, ts: ts + sec * 1000, ...more, duration: sec * 1000, props: { ...props, result, match_sec: matchSec } });
+  };
+  await play("h1", at(0, 10), "win", 40, 37);
+  await play("h1", at(0, 10, 2), "loss", 70, 66);
+  await play("h1", at(0, 10, 4), "draw", 100, 95);
+  await play("h1", at(0, 10, 7), "abandon", 500, 480);
+  await play("h1", at(0, 10, 20), "quit", 900, 880);
+  await play("h2", at(0, 11), "win", 3, 1);
+  await play("h2", at(0, 11, 1), "loss", 13, 10);
+}

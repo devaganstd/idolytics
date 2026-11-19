@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { env } from "cloudflare:workers";
 import { DAY } from "../src/rollup";
-import { at, MIN, NOW, seed, seedAsPlays, seedEconomy, seedIdle, seedMatch } from "./fixture";
+import { at, MIN, NOW, seed, seedAsPlays, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
 import { createProject, raw, reset, rollUp, rows } from "./helpers";
 import { runCron } from "../src/rollup";
 
@@ -38,12 +38,13 @@ describe("rollup", () => {
       { first_day: "2026-11-01", day: "2026-11-03", version: "1.0", platform: "ios", country: "US", devices: 1 },
       { first_day: "2026-11-02", day: "2026-11-02", version: "1.1", platform: "android", country: "ID", devices: 1 },
     ]);
-    const zero = { kind: "level", mode: "", difficulty: "", draws: 0, abandons: 0, prestiges: 0, starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0 };
+    const zero = { kind: "level", mode: "", difficulty: "", draws: 0, abandons: 0, prestiges: 0, starts: 0, players: 0, wins: 0, fails: 0, quits: 0, first_try_wins: 0, duration_sum: 0, duration_n: 0, stars_sum: 0, stars_n: 0, moves_left_sum: 0, moves_left_n: 0, first_starts: 0,
+      time_sum: 0, time_n: 0, ...Object.fromEntries(Array.from({ length: 20 }, (_, i) => [[`dh${i}`, 0], [`th${i}`, 0]]).flat()) };
     expect(s.levels).toEqual([
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "android",
-        starts: 2, players: 1, first_starts: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
+        starts: 2, players: 1, first_starts: 1, wins: 1, fails: 1, duration_sum: 220_000, duration_n: 2, dh7: 1, dh8: 1, stars_sum: 3, stars_n: 1, moves_left_sum: 2, moves_left_n: 1 },
       { ...zero, project_id: "demo", day: "2026-11-01", level: "1", version: "1.0", platform: "ios",
-        starts: 1, players: 1, first_starts: 1, wins: 1, first_try_wins: 1, duration_sum: 60_000, duration_n: 1, stars_sum: 1, stars_n: 1 },
+        starts: 1, players: 1, first_starts: 1, wins: 1, first_try_wins: 1, duration_sum: 60_000, duration_n: 1, dh6: 1, stars_sum: 1, stars_n: 1 },
       { ...zero, project_id: "demo", day: "2026-11-01", level: "2", version: "1.0", platform: "ios", starts: 1, players: 1, first_starts: 1, quits: 1 },
       { ...zero, project_id: "demo", day: "2026-11-02", level: "2", version: "1.0", platform: "android", starts: 1, players: 1, first_starts: 1, quits: 1 },
     ]);
@@ -258,6 +259,27 @@ describe("rollup", () => {
     expect(await rows("SELECT step, devices, skips FROM step_days WHERE flow = 'tutorial' ORDER BY step")).toEqual([
       { step: 0, devices: 1, skips: 0 }, { step: 1, devices: 1, skips: 0 }, { step: 2, devices: 1, skips: 1 },
     ]);
+  });
+
+  it("counts the duration and in-game time of completed plays only, with a histogram", async () => {
+    await seedDurations();
+    await rollUp(NOW);
+    // Histogram columns with a count, as {column: count}.
+    const hist = (r: Record<string, unknown>) => Object.fromEntries(Object.entries(r).filter(([k, v]) => /^[dt]h\d+$/.test(k) && v));
+    const got = (await rows("SELECT * FROM play_days ORDER BY platform")).map((r) => ({
+      platform: r.platform, duration_sum: r.duration_sum, duration_n: r.duration_n, time_sum: r.time_sum, time_n: r.time_n, ...hist(r),
+    }));
+    expect(got).toEqual([
+      { platform: "android", duration_sum: 210_000, duration_n: 3, time_sum: 198, time_n: 3, dh4: 1, dh6: 1, dh7: 1, th4: 1, th6: 1, th7: 1 },
+      { platform: "editor", duration_sum: 16_000, duration_n: 2, time_sum: 11, time_n: 2, dh0: 1, dh2: 1, th0: 1, th2: 1 },
+    ]);
+  });
+
+  it("counts no in-game time when the profile has no play_time_prop", async () => {
+    await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify({ preset: "match_battle", play_time_prop: "" })).run();
+    await seedDurations();
+    await rollUp(NOW);
+    expect(await rows("SELECT SUM(duration_n) AS dn, SUM(time_n) AS tn, SUM(th4) AS th4 FROM play_days")).toEqual([{ dn: 5, tn: 0, th4: 0 }]);
   });
 
   it("counts players per play kind", async () => {

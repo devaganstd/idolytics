@@ -141,6 +141,8 @@ The game profile declares which props keys are dimensions; a dimension marked `m
 
 A run is one prestige cycle: `play_start` with `props.kind` `run`, then `play_end` with `props.result` `prestige`, `value` the prestige currency gained and `duration_ms` the time to prestige. A prestige counts as a completed run, not a win.
 
+Play length (v0.3.2): the Plays page counts `duration_ms` of completed plays only (`win`, `loss`, `draw`, `prestige`, and `level_complete` and `level_fail`), not quits or abandons, and estimates the median and p90 from buckets of 0 to 5 s, 5 to 10 s, 10 to 20 s, 20 to 30 s, 30 to 45 s, 45 to 60 s, 60 to 90 s, 90 to 120 s, 2 to 3 min, 3 to 5 min, 5 to 10 min, 10 to 30 min, 30 to 60 min, 1 to 2 h, 2 to 4 h, 4 to 8 h, 8 to 16 h, 16 to 24 h, 24 to 48 h and over 48 h. `duration_ms` from the SDK includes waiting screens; send the in-game time as a numeric props key named by the profile's `play_time_prop`, such as `props.match_sec`.
+
 | Event | Fields |
 |---|---|
 | `offline_reward` | `duration_ms` (time offline), `value`, `currency`, `props.multiplier` (1, 2, 3), `props.via` (`free`, `ad`, `iap`) |

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { env, exports } from "cloudflare:workers";
 import { parseTz, tzLabel } from "../src/dashboard";
-import { at, NOW, seed, seedAsPlays, seedEconomy, seedIdle, seedMatch } from "./fixture";
+import { at, NOW, seed, seedAsPlays, seedDurations, seedEconomy, seedIdle, seedMatch } from "./fixture";
 import { PRESETS } from "../src/profile";
 import { BASE, batch, createProject, ev, post, raw, reset, rollUp } from "./helpers";
 
@@ -128,8 +128,8 @@ describe("dashboard pages", () => {
   it("shows the level table with distinct players and first try win rate", async () => {
     const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
     // Level 1: d1 fails then wins on attempt 2, d2 wins on attempt 1. Level 2: d2 left it, d1 quit it the next day.
-    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
-    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "1m 45s", "2m 42s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–", "–", "–"]);
     expect(html).toContain('href="/level?project=demo&amp;range=custom&amp;from=2026-11-01&amp;to=2026-11-03&amp;level=1"');
     expect(html).toMatch(/Quits \(inferred\)/);
   });
@@ -366,8 +366,8 @@ describe("game profiles: plays, progress, content and flows", () => {
     await seed();
     await rollUp(NOW);
     const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
-    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
-    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "1m 45s", "2m 42s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–", "–", "–"]);
     expect(html).toMatch(/>Levels<\/a>/);
     for (const tab of ["Progress", "Content", "Flows"]) expect(html).not.toMatch(new RegExp(`>${tab}</a>`));
   });
@@ -376,8 +376,8 @@ describe("game profiles: plays, progress, content and flows", () => {
     await seedAsPlays();
     await rollUp(NOW);
     const html = await (await get(`/levels?project=demo&${RANGE}`)).text();
-    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
-    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(cells(html, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "1m 45s", "2m 42s", "2.0", "2.0"]);
+    expect(cells(html, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–", "–", "–"]);
     // The same through the raw path.
     const raw = await (await get(`/levels?project=demo&${RANGE}&prop=kind%3Dlevel`)).text();
     expect(cells(raw, "1")?.slice(0, 6)).toEqual(["1", "3", "2", "2", "1", "0"]);
@@ -390,15 +390,15 @@ describe("game profiles: plays, progress, content and flows", () => {
     for (const tab of ["Matches", "Progress", "Content", "Flows"]) expect(html).toMatch(new RegExp(`>${tab}</a>`));
     expect(html).toContain("<h2>Matches</h2>");
     expect(cells(html, "Board ↑")).toEqual(["Board", "Starts", "Players", "Wins", "Losses", "Quits (inferred)", "Draws", "Abandons",
-      "Win rate", "First try win rate", "Attempts per win", "Avg duration"].map((c, i) => (i === 0 ? c + " ↑" : c)));
-    expect(cells(html, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s"]);
-    expect(cells(html, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s"]);
-    expect(cells(html, "delta")).toEqual(["delta", "2", "1", "0", "1", "0", "0", "1", "0%", "–", "–", "1m 00s"]);
+      "Win rate", "First try win rate", "Attempts per win", "Avg duration", "Median ≈", "p90 ≈"].map((c, i) => (i === 0 ? c + " ↑" : c)));
+    expect(cells(html, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s", "1m 15s", "1m 27s"]);
+    expect(cells(html, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s", "1m 15s", "1m 27s"]);
+    expect(cells(html, "delta")).toEqual(["delta", "2", "1", "0", "1", "0", "0", "1", "0%", "–", "–", "1m 00s", "1m 15s", "1m 27s"]);
     const diff = section(html, "By difficulty");
-    expect(cells(diff, "easy")).toEqual(["easy", "3", "2", "0", "1", "0", "0", "100%"]);
-    expect(cells(diff, "normal")).toEqual(["normal", "2", "0", "2", "0", "0", "0", "0%"]);
-    expect(cells(diff, "hard")).toEqual(["hard", "2", "0", "0", "0", "1", "1", "–"]);
-    expect(cells(section(html, "By mode"), "normal")).toEqual(["normal", "7", "2", "2", "1", "1", "1", "50%"]);
+    expect(cells(diff, "easy")).toEqual(["easy", "3", "2", "0", "1", "0", "0", "100%", "1m 15s", "1m 27s"]);
+    expect(cells(diff, "normal")).toEqual(["normal", "2", "0", "2", "0", "0", "0", "0%", "1m 15s", "1m 27s"]);
+    expect(cells(diff, "hard")).toEqual(["hard", "2", "0", "0", "0", "1", "1", "–", "1m 15s", "1m 27s"]);
+    expect(cells(section(html, "By mode"), "normal")).toEqual(["normal", "7", "2", "2", "1", "1", "1", "50%", "1m 15s", "1m 27s"]);
     expect(cells(section(html, "By opponent"), "bot")).toEqual(["bot", "6", "2", "2", "1", "50%"]);
     expect(html).not.toContain("Progression"); // the level funnel is for levels only
   });
@@ -531,8 +531,8 @@ describe("game profiles: plays, progress, content and flows", () => {
     const runs = await (await get(`/levels?project=demo&${RANGE}`)).text();
     expect(runs).toMatch(/>Runs<\/a>/);
     expect(cells(runs, "Run ↑")).toEqual(["Run ↑", "Starts", "Players", "Wins", "Losses", "Quits (inferred)", "Prestiges", "Win rate",
-      "First try win rate", "Attempts per win", "Avg duration"]);
-    expect(cells(runs, "(none)")).toEqual(["(none)", "4", "2", "0", "0", "1", "3", "–", "0%", "–", "19h 00m"]);
+      "First try win rate", "Attempts per win", "Avg duration", "Median ≈", "p90 ≈"]);
+    expect(cells(runs, "(none)")).toEqual(["(none)", "4", "2", "0", "0", "1", "3", "–", "0%", "–", "19h 00m", "14h 00m", "40h 48m"]);
 
     const progress = section(await (await get(`/progress?project=demo&${RANGE}`)).text(), "Income per second");
     expect(cells(progress, "Below 1K")).toEqual(["Below 1K", "1", "–", "–", "–"]);
@@ -558,17 +558,40 @@ describe("game profiles: plays, progress, content and flows", () => {
     expect(cells(flows, "2")).toEqual(["2", "1", "0%", "–", "1"]);
   });
 
+  it("shows avg, median and p90 duration and in-game time of completed plays, with and without the editor", async () => {
+    await seedDurations();
+    await rollUp(NOW);
+    const head = ["Board", "Starts", "Players", "Wins", "Losses", "Quits (inferred)", "Draws", "Abandons", "Win rate", "First try win rate",
+      "Attempts per win", "Avg duration", "Median ≈", "p90 ≈", "In-game avg", "In-game median ≈", "In-game p90 ≈"];
+    const all = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(all, "Board ↑")).toEqual(head.map((c, i) => (i === 0 ? c + " ↑" : c)));
+    expect(cells(all, "arena")).toEqual(["arena", "7", "2", "2", "2", "1", "1", "1", "50%", "100%", "3.5", "45s", "38s", "1m 45s", "42s", "38s", "1m 45s"]);
+    expect(all).toContain("props.match_sec");
+    expect(cells(section(all, "By mode"), "ranked")).toEqual(["ranked", "7", "2", "2", "1", "1", "1", "50%", "38s", "1m 45s"]);
+    expect(all).toContain("Exclude editor");
+    const noEditor = await (await get(`/levels?project=demo&${RANGE}&p=%21editor`)).text();
+    expect(cells(noEditor, "arena")).toEqual(["arena", "5", "1", "1", "1", "1", "1", "1", "50%", "100%", "5.0", "1m 10s", "1m 15s", "1m 51s", "1m 06s", "1m 15s", "1m 51s"]);
+    expect(cells(section(noEditor, "By mode"), "ranked")).toEqual(["ranked", "5", "1", "1", "1", "1", "1", "50%", "1m 15s", "1m 51s"]);
+    expect(noEditor).toContain("Include editor");
+    // The same filter on the other pages.
+    expect(kpi(await (await get(`/?project=demo&${RANGE}&p=%21editor`)).text(), "dau")).toBe("0.3");
+    // Without play_time_prop the in-game columns go; the duration numbers stay.
+    await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify({ preset: "match_battle", play_time_prop: "" })).run();
+    const plain = await (await get(`/levels?project=demo&${RANGE}`)).text();
+    expect(cells(plain, "arena")).toEqual(["arena", "7", "2", "2", "2", "1", "1", "1", "50%", "100%", "3.5", "45s", "38s", "1m 45s"]);
+  });
+
   it("keeps the 0.3.0 Levels and match numbers", async () => {
     await seed();
     await seedMatch();
     await rollUp(NOW);
     await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify(PRESETS.puzzle_levels)).run();
     const levels = await (await get(`/levels?project=demo&${RANGE}`)).text();
-    expect(cells(levels, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "2.0", "2.0"]);
-    expect(cells(levels, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–"]);
+    expect(cells(levels, "1")).toEqual(["1", "3", "2", "2", "1", "0", "67%", "50%", "1.5", "1m 33s", "1m 45s", "2m 42s", "2.0", "2.0"]);
+    expect(cells(levels, "2")).toEqual(["2", "2", "2", "0", "0", "2", "–", "0%", "–", "–", "–", "–", "–", "–"]);
     await env.DB.prepare("UPDATE projects SET profile = ?").bind(JSON.stringify(PRESETS.match_battle)).run();
     const matches = await (await get(`/levels?project=demo&${RANGE}`)).text();
-    expect(cells(matches, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s"]);
-    expect(cells(matches, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s"]);
+    expect(cells(matches, "hourglass")).toEqual(["hourglass", "3", "1", "1", "1", "1", "0", "0", "50%", "100%", "3.0", "1m 00s", "1m 15s", "1m 27s"]);
+    expect(cells(matches, "ring")).toEqual(["ring", "2", "2", "1", "0", "0", "1", "0", "100%", "–", "2.0", "1m 00s", "1m 15s", "1m 27s"]);
   });
 });

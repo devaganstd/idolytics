@@ -83,10 +83,13 @@ A game profile is a small JSON document stored per project and edited in Setting
     { "key": "deck", "multi": true, "label": "Card" }
   ],
   "flows": ["tutorial1", "tutorial2"],
+  "play_time_prop": "match_sec",
   "currencies": ["coins", "gems"],
   "moves_label": null
 }
 ```
+
+`play_time_prop` (v0.3.2, optional) names a numeric `play_end` props key with the in-game play time in seconds, without waiting screens such as a versus screen. The Plays page then shows its average, median and p90 as "In-game time". The `match_battle` preset sets it to `match_sec`; `""` unsets it.
 
 ### 3.1 Presets
 

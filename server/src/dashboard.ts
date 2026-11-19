@@ -4,7 +4,7 @@ import { newWriteKey, safeEqual, sha256Hex } from "./keys";
 import { effectiveProfile, parseProfile, plural, PRESETS, type Profile } from "./profile";
 import {
   cohortTable, contentPage, devicePage, type DimRow, economy, eventsPage, type Filters, flowsPage, type Kpis, levelDetail, type LevelRow, levelTable,
-  live, LIVE_MS, overview, parseFilters, progressPage, RANGES, RAW_MAX_DAYS, type Results, seenKeys, type StepRow, type TailRow, type TrackRow,
+  live, LIVE_MS, overview, parseFilters, progressPage, quantile, RANGES, RAW_MAX_DAYS, type Results, seenKeys, type StepRow, type TailRow, type TrackRow,
   usageToday,
 } from "./queries";
 import { DAY, dayOf, QUIT_AFTER_MS, STEP_DONE } from "./rollup";
@@ -103,6 +103,7 @@ function fromForm(form: FormData) {
     tracks: rows("t_on").map((i) => ({ key: g(`t_key_${i}`), ...label(`t_label_${i}`), milestones: nums(g(`t_ms_${i}`)), scale: g(`t_scale_${i}`) || undefined })),
     dimensions: rows("d_on").map((i) => ({ key: g(`d_key_${i}`), ...label(`d_label_${i}`), ...(form.get(`d_multi_${i}`) ? { multi: true } : {}) })),
     flows: form.getAll("flow").map(String).slice(0, 50),
+    play_time_prop: g("play_time_prop"),
   };
 }
 
@@ -273,8 +274,11 @@ export async function dashboard(request: Request, env: Env): Promise<Response> {
     rowsRead = r.rowsRead;
     const sort = url.searchParams.get("sort") ?? "level", dir = url.searchParams.get("dir") === "desc" ? "desc" : "asc";
     const keyLabel = profile?.dimensions.find((d) => d.key === "level")?.label ?? playLabel;
-    body = levelsBody(r.levels, sort, dir, (over) => link(over), (l) => link({ sort: null, dir: null, level: l }, "/level"),
-      { label: playLabel, keyLabel, funnel: !profile || profile.play_kinds.includes("level") }) + resultsBody(r);
+    const noEditor = f.p === "!editor";
+    const editor = `<p class="note"><a href="${esc(link({ p: noEditor ? null : "!editor" }))}">${noEditor ? "Include editor" : "Exclude editor"}</a>
+      ${noEditor ? "Plays from the Unity editor are left out." : "Plays from the Unity editor are often dev tests."}</p>`;
+    body = editor + levelsBody(r.levels, sort, dir, (over) => link(over), (l) => link({ sort: null, dir: null, level: l }, "/level"),
+      { label: playLabel, keyLabel, funnel: !profile || profile.play_kinds.includes("level"), timeProp: profile?.play_time_prop }) + resultsBody(r);
   } else if (url.pathname === "/content") {
     const dims = profile?.dimensions ?? [];
     const dim = dims.find((d) => d.key === url.searchParams.get("dim")) ?? dims[0];
@@ -341,7 +345,7 @@ function filterBar(f: Filters, path: string, project: string, testEnv: boolean, 
     `<label>${label} <select name="${name}"><option value="">${all}</option>${[...new Set([...values, ...(current ? [current] : [])])]
       .map((v) => `<option value="${esc(v)}"${v === current ? " selected" : ""}>${esc(v)}</option>`).join("")}</select></label>`;
   const rangeLabel = f.range === "custom" ? (f.from === f.to ? f.from : `${f.from} to ${f.to}`) : `${RANGES[f.range]} (${short(f.from)} to ${short(f.to)})`;
-  const active = [rangeLabel, f.compare ? "vs previous period" : "", f.v ? `version ${f.v}` : "", f.p ?? "", f.c ?? "",
+  const active = [rangeLabel, f.compare ? "vs previous period" : "", f.v ? `version ${f.v}` : "", f.p === "!editor" ? "not editor" : f.p ?? "", f.c ?? "",
     f.who === "all" ? "" : `${f.who} players`, f.device ? `device ${f.device}` : "", f.events.join(", "),
     ...f.props.map(([k, v]) => `${k}=${v}`), f.by ? `by ${f.by}` : ""].filter(Boolean).join(" · ");
   const text = (name: string, label: string, value: string, hint: string) =>
@@ -355,7 +359,7 @@ function filterBar(f: Filters, path: string, project: string, testEnv: boolean, 
       <label>To <input type="date" name="to" value="${f.range === "custom" ? f.to : ""}"></label>
       <label>Compare <select name="cmp"><option value="">Previous period</option><option value="off"${f.compare ? "" : " selected"}>Off</option></select></label>
       ${select("v", "Version", "All versions", o.versions, f.v)}
-      ${select("p", "Platform", "All platforms", o.platforms, f.p)}
+      ${select("p", "Platform", "All platforms", ["!editor", ...o.platforms], f.p).replace('value="!editor">!editor<', 'value="!editor">All but editor<').replace('value="!editor" selected>!editor<', 'value="!editor" selected>All but editor<')}
       ${select("c", "Country", "All countries", o.countries, f.c)}
       <label>Players <select name="who">${[["all", "All"], ["new", "New"], ["returning", "Returning"]].map(([k, v]) =>
         `<option value="${k === "all" ? "" : k}"${k === f.who ? " selected" : ""}>${v}</option>`).join("")}</select></label>
@@ -428,6 +432,15 @@ function retentionBody(r: Awaited<ReturnType<typeof cohortTable>>) {
 }
 
 const ratio = (a: number, b: number) => (b ? a / b : null);
+/** A bucket estimate of a play length, "≥" when it falls in the open last bucket. */
+const quant = (counts: number[], q: number) => { const v = quantile(counts, q); return v === null ? "–" : (v.open ? "≥ " : "") + dur(v.ms); };
+/** Median and p90 columns of the histogram h ("dh" duration, "th" in-game time). */
+function quantileCols(h: "dh" | "th", prefix: string, key: string): Col[] {
+  return ([["median", "Median", 0.5], ["p90", "p90", 0.9]] as const).map(([k, label, q]) => ({
+    key: `${key}_${k}`, label: `${prefix}${prefix ? label.toLowerCase() : label} ≈`,
+    value: (l: LevelRow) => quantile(l[h], q)?.ms ?? null, show: (l: LevelRow) => quant(l[h], q),
+  }));
+}
 const avg = (sum: number, n: number) => (n ? (sum / n).toFixed(1) : "–");
 type Col = { key: string; label: string; value: (l: LevelRow) => number | null; show?: (l: LevelRow) => string };
 const LEVEL_COLS: Col[] = [
@@ -443,20 +456,29 @@ const LEVEL_COLS: Col[] = [
   { key: "first", label: "First try win rate", value: (l) => ratio(l.first_try_wins, l.first_starts), show: (l) => pct(ratio(l.first_try_wins, l.first_starts)) },
   { key: "apw", label: "Attempts per win", value: (l) => ratio(l.starts, l.wins), show: (l) => (l.wins && l.starts ? (l.starts / l.wins).toFixed(1) : "–") },
   { key: "duration", label: "Avg duration", value: (l) => ratio(l.duration_sum, l.duration_n), show: (l) => dur(ratio(l.duration_sum, l.duration_n)) },
+  ...quantileCols("dh", "", "duration"),
+  { key: "time", label: "In-game avg", value: (l) => ratio(l.time_sum * 1000, l.time_n), show: (l) => dur(ratio(l.time_sum * 1000, l.time_n)) },
+  ...quantileCols("th", "In-game ", "time"),
   { key: "stars", label: "Avg stars", value: (l) => ratio(l.stars_sum, l.stars_n), show: (l) => avg(l.stars_sum, l.stars_n) },
   { key: "moves", label: "Avg moves left", value: (l) => ratio(l.moves_left_sum, l.moves_left_n), show: (l) => avg(l.moves_left_sum, l.moves_left_n) },
 ];
 const byLevel = (a: LevelRow, b: LevelRow) => Number(a.level) - Number(b.level) || a.level.localeCompare(b.level, "en", { numeric: true });
 
-/** Columns with data: draws, abandons, prestiges, stars and moves left only when some play has them. Fails are losses outside levels. */
-const levelCols = (levels: LevelRow[], label: string) => LEVEL_COLS.filter((c) =>
-  !["draws", "abandons", "prestiges", "stars", "moves"].includes(c.key) || levels.some((l) =>
+/**
+ * Columns with data: draws, abandons, prestiges, stars and moves left only when some play has them; median and p90 when the
+ * histogram has plays (not on raw filtered pages); in-game time when the profile names play_time_prop and some play sent it.
+ * Fails are losses outside levels.
+ */
+const levelCols = (levels: LevelRow[], label: string, timeProp?: string) => LEVEL_COLS.filter((c) =>
+  c.key.startsWith("time") ? !!timeProp && levels.some((l) => l.time_n > 0)
+  : c.key.startsWith("duration_") ? levels.some((l) => l.dh.some((n) => n > 0))
+  : !["draws", "abandons", "prestiges", "stars", "moves"].includes(c.key) || levels.some((l) =>
     (c.key === "stars" ? l.stars_n : c.key === "moves" ? l.moves_left_n : c.value(l)) as number > 0))
   .map((c) => (c.key === "fails" && label !== "Level" ? { ...c, label: "Losses" } : c));
 
 function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link: (over: Record<string, string | null>) => string, levelHref: (l: string) => string,
-  o: { label: string; keyLabel: string; funnel: boolean }) {
-  const COLS = levelCols(levels, o.label);
+  o: { label: string; keyLabel: string; funnel: boolean; timeProp?: string }) {
+  const COLS = levelCols(levels, o.label, o.timeProp);
   const col = COLS.find((c) => c.key === sort);
   const sorted = [...levels].sort((a, b) => {
     if (!col) return dir === "desc" ? byLevel(b, a) : byLevel(a, b);
@@ -482,7 +504,9 @@ function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link:
     <div class="scroll"><table class="levels"><thead><tr>${head}</tr></thead>
     <tbody>${rows || `<tr><td colspan="${COLS.length + 1}" class="empty">No play events in this range.</td></tr>`}</tbody></table></div>
     <p class="note">Players are distinct devices that started it. Win rate is wins / (wins + ${o.label === "Level" ? "fails" : "losses"}). First try win rate is wins on attempt 1 /
-    starts of attempt 1. Attempts per win is starts / wins. Stars and moves left are averaged over wins that sent them. Quits are inferred:
+    starts of attempt 1. Attempts per win is starts / wins. Duration is duration_ms of completed plays only (win, ${o.label === "Level" ? "fail" : "loss"}, draw, prestige),
+    not quits or abandons; median and p90 are estimated (≈) from buckets of 0 to 5 s, 5 to 10 s and on up to 48 h.${COLS.some((c) => c.key === "time")
+      ? ` In-game time is props.${esc(o.timeProp ?? "")} of completed plays, in seconds.` : ""} Stars and moves left are averaged over wins that sent them. Quits are inferred:
     quits the game sends plus starts with no result for ${QUIT_AFTER_MS / 60_000} minutes, counted on the day of the start. Select one for its detail.</p></section>
   ${o.funnel ? `<section><h2>Progression</h2><p class="note">Players who started each level in the range, as a share of the first level's players.</p>
     ${steps ? `<ol class="funnel">${steps}</ol>` : `<p class="empty">No level events in this range.</p>`}</section>` : ""}`;
@@ -491,8 +515,9 @@ function levelsBody(levels: LevelRow[], sort: string, dir: "asc" | "desc", link:
 function resultsBody(r: { modes: Results[]; difficulties: Results[]; opponents: DimRow[] }) {
   const table = (title: string, rows: Results[]) => rows.length ? `<section><h2>By ${title}</h2>
     <div class="scroll"><table><thead><tr><th>${title[0].toUpperCase() + title.slice(1)}</th><th>Starts</th><th>Wins</th><th>Losses</th><th>Quits (inferred)</th>
-    <th>Draws</th><th>Abandons</th><th>Win rate</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.key)}</td><td>${x.starts}</td><td>${x.wins}</td>
-    <td>${x.fails}</td><td>${x.quits}</td><td>${x.draws}</td><td>${x.abandons}</td><td>${pct(ratio(x.wins, x.wins + x.fails))}</td></tr>`).join("")}</tbody></table></div></section>` : "";
+    <th>Draws</th><th>Abandons</th><th>Win rate</th><th>Median duration ≈</th><th>p90 duration ≈</th></tr></thead><tbody>${rows.map((x) => `<tr><td>${esc(x.key)}</td><td>${x.starts}</td><td>${x.wins}</td>
+    <td>${x.fails}</td><td>${x.quits}</td><td>${x.draws}</td><td>${x.abandons}</td><td>${pct(ratio(x.wins, x.wins + x.fails))}</td>
+    <td>${quant(x.dh, 0.5)}</td><td>${quant(x.dh, 0.9)}</td></tr>`).join("")}</tbody></table></div></section>` : "";
   const opp = r.opponents.length ? `<section><h2>By opponent</h2><p class="note">Ended plays by props.opponent.</p>
     <div class="scroll"><table><thead><tr><th>Opponent</th><th>Plays</th><th>Wins</th><th>Losses</th><th>Draws</th><th>Win rate</th></tr></thead>
     <tbody>${r.opponents.map((x) => `<tr><td>${esc(x.value)}</td><td>${x.plays}</td><td>${x.wins}</td><td>${x.losses}</td><td>${x.draws}</td>
@@ -586,6 +611,8 @@ function profileBody(current: Proj, saved: Profile | null, shown: Profile, seen:
       <input type="hidden" name="preset" value="${esc(shown.preset)}">
       <div class="pair"><label>Play label <input name="play_label" value="${esc(shown.play_label)}" maxlength="20" required></label>
       <label>Play kinds <input name="play_kinds" value="${esc(shown.play_kinds.join(", "))}" placeholder="level, match, run"></label></div>
+      <label>In-game time prop <input name="play_time_prop" value="${esc(shown.play_time_prop ?? "")}" maxlength="40" placeholder="match_sec"></label>
+      <p class="note">A numeric play_end props key with the play time in seconds without waiting screens; the Plays page then shows its average, median and p90.</p>
       <h3>Tracks</h3><div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Milestones</th><th>Scale</th></tr></thead><tbody>${trackRows}</tbody></table></div>
       <h3>Dimensions</h3><p class="note">Props keys of play events; at most 12 checked. Multi splits a comma-separated value, such as a deck.</p>
       <div class="scroll"><table class="form"><thead><tr><th></th><th>Key</th><th>Label</th><th>Multi</th><th>Seen</th></tr></thead><tbody>${dimRows}</tbody></table></div>
