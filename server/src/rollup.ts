@@ -139,18 +139,24 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   cost.queries += 5; // the raw select and up to four reads
   const tz = p.tz_min;
   const hi = now - LAG_MS;
-  const rows = (await db.prepare(
+  const fetched = (await db.prepare(
     `SELECT event_id, name, device_id, session_id, client_ts, received_at, app_version, platform, country, level,
        attempt, duration_ms, value, currency, props
      FROM events WHERE project_id = ?1 AND (received_at, event_id) > (?2, ?3) AND received_at <= ?4
      ORDER BY received_at, event_id LIMIT ?5`,
   ).bind(p.id, p.wm_at, p.wm_id, hi, chunk).all<Raw>()).results;
+  // A full chunk may cut an ingest batch (one received_at) in two: leave its last batch for the next run, so a batch is
+  // always replayed whole, unless the chunk holds a single batch.
+  const tail = fetched.at(-1)?.received_at;
+  const rows = fetched.length === chunk && fetched[0].received_at !== tail ? fetched.filter((r) => r.received_at !== tail) : fetched;
   const last = rows.at(-1);
-  const caughtUp = rows.length < chunk;
+  const caughtUp = fetched.length < chunk;
   // Rows up to here are rolled up; a start received 30 minutes before it with no result is a quit.
   const aged = (caughtUp ? hi : last!.received_at) - QUIT_AFTER_MS;
-  const live = p.rebuild_until === null ? rows
-    : rows.filter((r) => !(r.received_at <= p.rebuild_until! && r.client_ts < p.rebuild_from!));
+  // Rows of one ingest batch share received_at and their event ids are random, so replay them in device time order:
+  // a play_start then sorts before its play_end. The watermark still follows the fetch order (last, above).
+  const live = rows.filter((r) => p.rebuild_until === null || !(r.received_at <= p.rebuild_until && r.client_ts < p.rebuild_from!))
+    .sort((a, b) => a.received_at - b.received_at || a.client_ts - b.client_ts || (a.event_id < b.event_id ? -1 : a.event_id > b.event_id ? 1 : 0));
 
   const ids = [...new Set(live.map((r) => r.device_id))];
   const days = live.map((r) => dayOf(r.client_ts, tz)).sort();
@@ -471,7 +477,7 @@ export async function rollupProject(db: D1Database, project: Project, now: numbe
   ];
   cost.queries += writes.length;
   await db.batch(writes);
-  return rows.length;
+  return fetched.length;
 }
 
 /** Drops keys not seen since day, so the Settings form suggests only the last 7 days. */

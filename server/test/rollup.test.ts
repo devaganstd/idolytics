@@ -311,6 +311,32 @@ describe("rollup", () => {
     expect(dim({ bucket: 30 })().dimensions).toEqual([{ key: "trophies", bucket: 30 }]);
   });
 
+  it("pairs a play's start and end that arrive in one batch whatever their event ids", async () => {
+    // One batch: the same received_at, and the end's id sorts before the start's, as random UUIDs can.
+    const props = { kind: "match", trophies: 10 };
+    await raw({ id: "a-end", name: "play_end", device: "u1", session: "s", ts: at(0, 10, 1), received: at(0, 10, 2), level: "arena", attempt: 1,
+      duration: 60_000, props: { ...props, trophies: 40, result: "win" } });
+    await raw({ id: "b-start", name: "play_start", device: "u1", session: "s", ts: at(0, 10), received: at(0, 10, 2), level: "arena", attempt: 1, props });
+    await rollUp(NOW);
+    expect(await rows("SELECT starts, wins, quits FROM play_days")).toEqual([{ starts: 1, wins: 1, quits: 0 }]);
+    expect(await rows("SELECT value, plays FROM dim_days WHERE dim = 'trophies'")).toEqual([{ value: "0-29", plays: 1 }]);
+  });
+
+  it("keeps a batch whole when the chunk limit falls inside it, for either id order", async () => {
+    const props = { kind: "match", trophies: 10 };
+    const batch = async (device: string, endId: string, startId: string) => {
+      await raw({ id: `${device}-0`, name: "session_start", device, session: "s", ts: at(0, 9), received: at(0, 9) });
+      await raw({ id: endId, name: "play_end", device, session: "s", ts: at(0, 10, 1), received: at(0, 10, 2), level: "arena", attempt: 1,
+        duration: 60_000, props: { ...props, trophies: 40, result: "win" } });
+      await raw({ id: startId, name: "play_start", device, session: "s", ts: at(0, 10), received: at(0, 10, 2), level: "arena", attempt: 1, props });
+    };
+    await batch("u1", "u1-a-end", "u1-b-start");
+    await batch("u2", "u2-b-end", "u2-a-start");
+    await rollUp(NOW, 3); // the first chunk of 3 rows ends inside the u1 batch
+    expect(await rows("SELECT SUM(starts) AS starts, SUM(wins) AS wins, SUM(quits) AS quits FROM play_days")).toEqual([{ starts: 2, wins: 2, quits: 0 }]);
+    expect(await rows("SELECT value, SUM(plays) AS plays FROM dim_days WHERE dim = 'trophies' GROUP BY value")).toEqual([{ value: "0-29", plays: 2 }]);
+  });
+
   it("counts players per play kind", async () => {
     await raw({ name: "play_start", device: "x", session: "s", ts: at(0, 10), level: "1", attempt: 1, props: { kind: "level" } });
     await raw({ name: "play_start", device: "x", session: "s", ts: at(0, 10, 1), level: "1", attempt: 2, props: { kind: "match" } });
